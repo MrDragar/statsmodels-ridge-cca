@@ -8,6 +8,7 @@
   "synthetic_components": 2,
   "real_components": 3,
   "penalty_values": [0.001, 0.01, 0.1, 1, 10],
+  "fixed_penalty": [1, 1],
   "pma_l1_bounds": [0.25, 0.4, 0.6, 0.8, 1],
   "dimensions": [
     {"n": 500, "p": 20, "q": 20},

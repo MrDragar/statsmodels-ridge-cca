@@ -38,12 +38,12 @@ from benchmarks.synthetic import make_cca_data
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / 'reports/implementation'
 METHODS = ['legacy_cancorr', 'ridge_cancorr', 'sklearn_cca', 'sklearn_pls',
-           'cca_zoo', 'r_ridge', 'r_classical', 'r_pma']
+           'cca_zoo', 'r_ridge', 'r_classical', 'r_pma', 'ridge_fixed']
 LABELS = {'legacy_cancorr': 'CanCorr исходный, α=0',
           'ridge_cancorr': 'CanCorr ridge + K-fold', 'sklearn_cca': 'sklearn CCA',
           'sklearn_pls': 'sklearn PLSCanonical', 'cca_zoo': 'CCA-Zoo RidgeCCA + K-fold',
           'r_ridge': 'R CCA::rcc + K-fold', 'r_classical': 'R CCA::cc',
-          'r_pma': 'R PMA::CCA + K-fold'}
+          'r_pma': 'R PMA::CCA + K-fold', 'ridge_fixed': 'CanCorr ridge, фиксированные штрафы'}
 
 
 def clean(value):
@@ -170,6 +170,14 @@ def evaluate(model, x, y, data=None, test=None):
     return result
 
 
+def fit_fixed_penalty(x, y, settings, k, data=None, test=None):
+    start = perf_counter()
+    penalty = tuple(settings['fixed_penalty'])
+    model = fit_python('ridge_cancorr', x, y, k, penalty)
+    elapsed = perf_counter() - start
+    return {'penalty': penalty, 'fit_seconds': elapsed, **evaluate(model, x, y, data, test)}
+
+
 def run_case(worker, x, y, settings, seed, k, data=None, test=None):
     grid = list(itertools.product(settings['penalty_values'], repeat=2))
     pma_grid = list(itertools.product(settings['pma_l1_bounds'], repeat=2))
@@ -212,6 +220,8 @@ def run_case(worker, x, y, settings, seed, k, data=None, test=None):
                            ('x_mean', 'y_mean', 'x_coef', 'y_coef', 'roots', 'train_correlations')}
         records[method].update(evaluate(model, x, y, data, test))
         models[method] = model
+    print('    ridge_fixed', flush=True)
+    records['ridge_fixed'] = fit_fixed_penalty(x, y, settings, k, data, test)
     full = CanCorr(y, x, penalty=records['ridge_cancorr']['penalty'], standardize=True)
     checks = correctness(from_cancorr(full, len(full.cancorr)),
                          response['correctness_reference'], x, y)
@@ -323,7 +333,7 @@ def main():
         return
     sources = [source, *(ROOT / 'benchmarks' / file for file in
                         ['methods.py', 'r_baselines.R', 'synthetic.py', 'run_experiments.py',
-                         'export_results.py', 'tables.py'])]
+                         'export_results.py', 'tables.py', 'penalties.py'])]
     hashes = {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources}
     report = {'scope': 'Estimation, tuned baseline comparison and correctness; no permutation tests',
               'settings': settings, 'source_sha256': hashes, 'statsmodels_base_commit': BASE,
@@ -334,6 +344,7 @@ def main():
               'protocol': {'synthetic': 'Full n training, exact population evaluation, 5 independent repetitions.',
                            'real': '5 outer folds, 5 inner folds; mean signed per-fold score correlations, not pooled scores. Full-data tuned fits are recorded separately.',
                            'tuning': 'First score correlation. Identical folds and additive-ridge grid across implementations. R reuses fold SVDs in exact grid scorer; final fits use actual CCA::rcc. PMA uses its own L1-bound grid and 100 iterations.',
+                           'fixed_penalty': 'The same CanCorr estimator with a predeclared fixed pair, trained on identical samples and evaluated on the same population or external folds. External scores do not select penalties.',
                            'timing': 'Wall seconds, BLAS threads=1. fit_seconds excludes tuning; Python tuned fits are separately timed repeats. R timings include fold-cache preparation and package validation check. Initial namespace/import startup and data I/O excluded.',
                            'correctness': 'Ridge reference at identical penalties; relative errors <1e-6 and max sin(principal angle)<1e-6. Classical outputs must equal pristine CanCorr exactly.',
                            'choices': 'Repetitions, signal strengths, components, grids and folds are experiment settings; only dataset dimensions come from proposal.',

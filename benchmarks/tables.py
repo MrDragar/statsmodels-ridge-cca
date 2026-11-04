@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
+from benchmarks.penalties import penalty_tables
 from benchmarks.run_experiments import LABELS, METHODS
 
 
@@ -109,7 +110,26 @@ def write_tables(report, path):
                      for row in entry['outer_folds']]
             lines.append('| ' + ' | '.join([LABELS[method], *cells]) + ' |')
         lines.append('')
-    lines += ['## Correctness из proposal', '',
+    lines += ['## Подбор штрафов против фиксированной пары', '',
+              'Сравнивается первая компонента одного и того же CanCorr: K-fold подбор',
+              'и заранее фиксированная пара. Обучающие данные и внешняя оценка одинаковы.',
+              'Синтетика: популяционная корреляция найденных проекций. Реальные данные:',
+              'test-корреляция на внешних folds; итоговые full-data fits сюда не входят.',
+              'Все значения — mean ± sample std. Разность CV − fixed сначала',
+              'считается внутри каждого повторения/fold, затем агрегируется.',
+              'Это сравнение с одним контролем, а не доказательство оптимальности штрафов.', '',
+              '| Данные | Фиксированная пара | CV | Fixed | CV − fixed |',
+              '|---|---|---|---|---|']
+    for row in penalty_tables(report)['penalty_selection_summary.csv']:
+        name = (f"{row['n']}, {row['p']}, {row['q']}; {row['scenario']}"
+                if row['dataset'] == 'synthetic' else row['dataset'])
+        cells = [f"{row[p + '_mean']:.4f} ± {row[p + '_std']:.4f}"
+                 if row[p + '_std'] is not None else '—'
+                 for p in ('cv_correlation', 'fixed_correlation', 'difference')]
+        lines.append('| ' + ' | '.join([name, f"({row['fixed_penalty_x']:g}, {row['fixed_penalty_y']:g})", *cells]) + ' |')
+    lines += ['', 'Полные validation grids с mean/std каждого кандидата — `penalty_grid.csv`;',
+              'выбранные пары, границы сетки и разрыв до следующего кандидата — `penalty_choices.csv`.', '',
+              '## Correctness из proposal', '',
               'Ridge сравнивается с CCA::rcc на тех же данных и тех же выбранных штрафах',
               'по всем наблюдаемым компонентам: min(rank(X),rank(Y)). Дополнительные',
               'нулевые корни R проверяются отдельно (absolute value <10⁻⁸). Дополнительно для ridge',

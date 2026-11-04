@@ -9,13 +9,14 @@ from pathlib import Path
 
 import numpy as np
 
+from benchmarks.penalties import penalty_tables, plot_penalties
 from benchmarks.run_experiments import METHODS, OUT
 from benchmarks.tables import write_tables
 
 NAMES = {'legacy_cancorr': 'CanCorr', 'ridge_cancorr': 'CanCorr ridge (CV)',
          'sklearn_cca': 'sklearn CCA', 'sklearn_pls': 'sklearn PLSCanonical',
          'cca_zoo': 'CCA-Zoo ridge (CV)', 'r_ridge': 'R rcc (CV)',
-         'r_classical': 'R cc', 'r_pma': 'R PMA (CV)'}
+         'r_classical': 'R cc', 'r_pma': 'R PMA (CV)', 'ridge_fixed': 'CanCorr ridge (fixed)'}
 
 
 def at(values, index):
@@ -139,7 +140,7 @@ def csv_tables(report):
         correctness.append(row)
     return {'synthetic_summary.csv': syn_summary, 'synthetic_runs.csv': synthetic,
             'real_summary.csv': real_summary, 'real_runs.csv': real,
-            'correctness.csv': correctness, 'runtime.csv': times}
+            'correctness.csv': correctness, 'runtime.csv': times, **penalty_tables(report)}
 
 
 def write_csv(path, rows):
@@ -226,6 +227,7 @@ def write_outputs(report, directory):
         write_csv(directory / name, rows)
     write_tables(report, directory / 'benchmark_tables.md')
     plots(tables, report['settings'], directory)
+    plot_penalties(report, tables, directory)
 
 
 def main():
