@@ -1,0 +1,22 @@
+{
+  "description": "Dimensions from proposal Table I. Other numerical settings are explicit experiment choices, not values claimed to be in the proposal.",
+  "seed": 20261104,
+  "repetitions": 5,
+  "cv": 5,
+  "outer_cv": 5,
+  "standardize": true,
+  "synthetic_components": 2,
+  "real_components": 3,
+  "penalty_values": [0.001, 0.01, 0.1, 1, 10],
+  "pma_l1_bounds": [0.25, 0.4, 0.6, 0.8, 1],
+  "dimensions": [
+    {"n": 500, "p": 20, "q": 20},
+    {"n": 50, "p": 100, "q": 100},
+    {"n": 200, "p": 500, "q": 200}
+  ],
+  "population_correlations": {
+    "no_link": [],
+    "one_link": [0.8],
+    "two_links": [0.8, 0.5]
+  }
+}

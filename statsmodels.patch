@@ -1,0 +1,1132 @@
+diff --git a/docs/source/multivariate.rst b/docs/source/multivariate.rst
+index 76be0d566..35afb12fe 100644
+--- a/docs/source/multivariate.rst
++++ b/docs/source/multivariate.rst
+@@ -62,6 +62,41 @@ Canonical Correlation
+    :toctree: generated/
+ 
+    CanCorr
++   select_cancorr_penalty
++
++Ridge canonical correlation
++~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++``CanCorr(endog, exog, penalty=(alpha_x, alpha_y))`` adds trace-relative
++ridge penalties to the sample covariance matrices of ``exog`` and ``endog``.
++Positive penalties permit wide or collinear views. The default penalties are
++zero and preserve the classical calculation, coefficient normalization and
++F-test output. ``standardize=True`` uses training standard deviations;
++``transform(exog, endog)`` applies the fitted preprocessing to new paired rows.
++
++``penalized_roots`` contains the singular values of the ridge objective.
++``cancorr`` contains the Pearson correlations of the fitted training scores;
++the two generally differ under regularization. Components are ordered by
++``penalized_roots``. Held-out score correlations can be negative and their
++signs must not be changed based on validation or test data.
++
++``select_cancorr_penalty`` chooses a penalty pair using the mean signed
++first-component held-out correlation over shuffled K-fold splits. All
++preprocessing is fitted within each training fold, and the selected model is
++refitted on the supplied training data. For example::
++
++    from statsmodels.multivariate.cancorr import select_cancorr_penalty
++
++    grid = [(0.01, 0.01), (0.1, 0.1), (1.0, 1.0)]
++    result = select_cancorr_penalty(y_train, x_train, grid, cv=5,
++                                   standardize=True, rng=123)
++    x_scores, y_scores = result.model.transform(x_test, y_test)
++
++The cross-validation score is a selection criterion. Evaluate generalization
++on separate test observations. Neither numerical agreement with a reference
++implementation nor a large training correlation establishes statistical
++significance. The classical ``corr_test`` F approximation is unavailable for
++penalized fits; a permutation test for these fits is not implemented here.
+ 
+ 
+ MANOVA
+diff --git a/docs/source/release/version0.15.1.rst b/docs/source/release/version0.15.1.rst
+index 2588ba739..b50ea2fc4 100644
+--- a/docs/source/release/version0.15.1.rst
++++ b/docs/source/release/version0.15.1.rst
+@@ -155,6 +155,13 @@ New Features and Enhancements
+ New functions and methods
+ -------------------------
+ 
++- Add trace-relative ridge penalties and training-based ``transform`` to
++  :class:`~statsmodels.multivariate.cancorr.CanCorr`, preserving the default
++  zero-penalty calculation. Add
++  :func:`~statsmodels.multivariate.cancorr.select_cancorr_penalty` for K-fold
++  selection using signed held-out correlations. Penalized objective values
++  are stored separately from Pearson score correlations; the classical
++  F approximation is disabled for penalized fits.
+ - Add :func:`~statsmodels.stats.diagnostic.compare_vuong`, the Vuong test for
+   non-nested likelihood models, and its result class ``VuongTestResult``. The
+   test supports AIC and BIC corrections and one-sided alternatives. The
+diff --git a/statsmodels/multivariate/api.py b/statsmodels/multivariate/api.py
+index 909d30615..e977d7e52 100644
+--- a/statsmodels/multivariate/api.py
++++ b/statsmodels/multivariate/api.py
+@@ -6,11 +6,12 @@ __all__ = [
+     "FactorResults",
+     "MultivariateLS",
+     "MultivariateLSResults",
+-    "factor_rotation"
++    "factor_rotation",
++    "select_cancorr_penalty"
+ ]
+ 
+ from . import factor_rotation
+-from .cancorr import CanCorr
++from .cancorr import CanCorr, select_cancorr_penalty
+ from .factor import Factor, FactorResults
+ from .manova import MANOVA
+ from .multivariate_ols import MultivariateLS, MultivariateLSResults
+diff --git a/statsmodels/multivariate/cancorr.py b/statsmodels/multivariate/cancorr.py
+index 98c561ccd..105477080 100644
+--- a/statsmodels/multivariate/cancorr.py
++++ b/statsmodels/multivariate/cancorr.py
+@@ -9,10 +9,39 @@ import scipy
+ 
+ from statsmodels.base.model import Model
+ from statsmodels.iolib import summary2
++from statsmodels.tools.tools import Bunch
+ 
+ from .multivariate_ols import multivariate_stats
+ 
+ 
++def _validate_penalty(penalty):
++    values = np.asarray(penalty, dtype=float)
++    if values.ndim == 0:
++        values = np.repeat(values, 2)
++    if values.shape != (2,) or not np.isfinite(values).all() or np.any(values < 0):
++        raise ValueError("penalty must contain two finite nonnegative values")
++    return tuple(float(value) for value in values)
++
++
++def _validate_views(exog, endog, min_rows):
++    x, y = np.asarray(exog, dtype=float), np.asarray(endog, dtype=float)
++    if x.ndim != 2 or y.ndim != 2 or not x.shape[1] or not y.shape[1]:
++        raise ValueError("Views must be nonempty two-dimensional arrays")
++    if len(x) != len(y) or len(x) < min_rows:
++        raise ValueError(f"Views need matching rows and at least {min_rows} observations")
++    if not np.isfinite(x).all() or not np.isfinite(y).all():
++        raise ValueError("Views must contain only finite values")
++    return x, y
++
++
++def _paired_correlations(x, y):
++    xc, yc = x - x.mean(0), y - y.mean(0)
++    denominator = np.linalg.norm(xc, axis=0) * np.linalg.norm(yc, axis=0)
++    if len(x) < 2 or np.any(denominator == 0):
++        raise ValueError("Correlation requires at least two nonconstant score observations")
++    return np.clip(np.sum(xc * yc, axis=0) / denominator, -1, 1)
++
++
+ class CanCorr(Model):
+     """
+     Canonical correlation analysis using singular value decomposition
+@@ -42,6 +71,16 @@ class CanCorr(Model):
+         Indicates whether the RHS includes a user-supplied constant. If True,
+         a constant is assumed. If False, no constant is checked for. If
+         None, the code checks for a constant.
++    penalty : float or pair of float, optional
++        Nonnegative trace-relative ridge penalties for exog and endog,
++        respectively. A scalar applies to both views. The default, zero,
++        preserves the classical calculation. The covariance penalty in each
++        view is ``penalty * trace(S) / n_features``, where S is its sample
++        covariance after training preprocessing.
++    standardize : bool, optional
++        Standardize each view by its training sample standard deviations.
++        The default is False. Constant columns have scale one; a view with
++        zero penalty must still have full column rank.
+     **kwargs
+         Extra arguments that are used to set model properties when using the
+         formula interface.
+@@ -58,6 +97,26 @@ class CanCorr(Model):
+         The canonical coefficients for endog
+     x_cancoef : ndarray
+         The canonical coefficients for exog
++    penalized_roots : ndarray
++        Singular values of the ridge-whitened cross-covariance. These equal
++        cancorr for the classical default but generally differ under ridge.
++    x_mean, y_mean : ndarray
++        Training means of exog and endog.
++    x_scale, y_scale : ndarray
++        Training standard deviations, or ones when standardize is False.
++    lambda_x, lambda_y : float
++        Absolute covariance penalties after training preprocessing.
++
++    Notes
++    -----
++    With positive penalties the method supports collinear and wide views.
++    Components follow the order of penalized_roots; cancorr contains Pearson
++    correlations of their training scores and need not have the same values
++    or ordering. Coefficients apply to centered original features, with any
++    standardization already absorbed into them. Their normalization uses
++    unit penalized sums of squares, continuously extending the classical
++    normalization. Only numerically nonzero data directions are retained.
++    The classical F approximation is not available for penalized fits.
+ 
+     References
+     ----------
+@@ -67,15 +126,93 @@ class CanCorr(Model):
+     """
+ 
+     def __init__(
+-        self, endog, exog, tolerance=1e-8, missing="none", hasconst=None, **kwargs
++        self, endog, exog, tolerance=1e-8, missing="none", hasconst=None,
++        *, penalty=0.0, standardize=False, **kwargs
+     ):
++        self.penalty = _validate_penalty(penalty)
++        if not isinstance(standardize, (bool, np.bool_)):
++            raise ValueError("standardize must be a boolean")
++        self.standardize = bool(standardize)
+         super().__init__(endog, exog, missing=missing, hasconst=hasconst, **kwargs)
++        # ModelData squeezes a single endogenous column to one dimension.
++        if self.endog.ndim == 1:
++            self.endog = self.endog[:, None]
++        self._init_keys.extend(["penalty", "standardize"])
+         # Declared before `_fit` populates them, for a consistent attribute
+         # set even if an exception occurs during fitting.
+         self.cancorr = None
+         self.x_cancoef = None
+         self.y_cancoef = None
+-        self._fit(tolerance)
++        self.x_mean = np.asarray(self.exog).mean(0)
++        self.y_mean = np.asarray(self.endog).mean(0)
++        self.x_scale = np.ones(self.exog.shape[1])
++        self.y_scale = np.ones(self.endog.shape[1])
++        self.lambda_x = self.lambda_y = 0.0
++        if self.penalty == (0.0, 0.0) and not self.standardize:
++            # Keep the existing path, including coefficient normalization.
++            self._fit(tolerance)
++            self.penalized_roots = self.cancorr.copy()
++        else:
++            self._fit_ridge(tolerance)
++
++    def _fit_ridge(self, tolerance):
++        x, y = _validate_views(self.exog, self.endog, min_rows=3)
++        xc, yc = x - self.x_mean, y - self.y_mean
++        if self.standardize:
++            self.x_scale = xc.std(0, ddof=1)
++            self.y_scale = yc.std(0, ddof=1)
++            self.x_scale[self.x_scale == 0] = 1
++            self.y_scale[self.y_scale == 0] = 1
++        xc, yc = xc / self.x_scale, yc / self.y_scale
++        n_minus_one = len(x) - 1
++
++        def factors(z, alpha):
++            u, s, vt = svd(z, full_matrices=False)
++            threshold = max(tolerance, s[0] * max(z.shape) * np.finfo(float).eps)
++            rank = int(np.sum(s > threshold))
++            if not rank:
++                raise ValueError("Each view must have nonzero numerical rank")
++            if alpha == 0 and rank < z.shape[1]:
++                raise ValueError("A view with zero penalty must have full column rank")
++            lam = float(alpha * np.sum(s ** 2) / n_minus_one / z.shape[1])
++            if not np.isfinite(lam * n_minus_one):
++                raise ValueError("The covariance penalty is too large")
++            s, u, vt = s[:rank], u[:, :rank], vt[:rank]
++            denominator = np.sqrt(s ** 2 + n_minus_one * lam)
++            return u, s / denominator, vt.T / denominator, lam
++
++        ux, fx, wx, self.lambda_x = factors(xc, self.penalty[0])
++        uy, fy, wy, self.lambda_y = factors(yc, self.penalty[1])
++        left, roots, right = svd(fx[:, None] * (ux.T @ uy) * fy[None, :],
++                                 full_matrices=False)
++        self.x_cancoef = (wx @ left) / self.x_scale[:, None]
++        self.y_cancoef = (wy @ right.T) / self.y_scale[:, None]
++        self.penalized_roots = roots
++        u, v = self.transform(x, y)
++        self.cancorr = _paired_correlations(u, v)
++
++    def transform(self, exog, endog):
++        """Project paired observations using the fitted training preprocessing.
++
++        Parameters
++        ----------
++        exog : array_like
++            New exog observations, with the training feature count.
++        endog : array_like
++            Paired new endog observations, with the training feature count.
++
++        Returns
++        -------
++        x_scores : ndarray
++            Canonical scores for exog.
++        y_scores : ndarray
++            Canonical scores for endog, in the training component order.
++        """
++        x, y = _validate_views(exog, endog, min_rows=1)
++        if x.shape[1] != self.exog.shape[1] or y.shape[1] != self.endog.shape[1]:
++            raise ValueError("Feature counts must match the training views")
++        return ((x - self.x_mean) @ self.x_cancoef,
++                (y - self.y_mean) @ self.y_cancoef)
+ 
+     def _fit(self, tolerance=1e-8):
+         """
+@@ -134,6 +271,10 @@ class CanCorr(Model):
+         CanCorrTestResults
+             Instance holding the canonical correlation test results.
+         """
++        if self.penalty != (0.0, 0.0):
++            raise NotImplementedError(
++                "The classical F approximation is not available for regularized fits"
++            )
+         nobs, k_yvar = self.endog.shape
+         nobs, k_xvar = self.exog.shape
+         eigenvals = np.power(self.cancorr, 2)
+@@ -181,6 +322,82 @@ class CanCorr(Model):
+         return CanCorrTestResults(stats, stats_mv)
+ 
+ 
++def select_cancorr_penalty(endog, exog, penalty_grid, cv=5, standardize=False, rng=None):
++    """Select ridge penalties by K-fold held-out canonical correlation.
++
++    Parameters
++    ----------
++    endog, exog : array_like
++        Complete, finite paired training views. No external test data are
++        accepted. Centering, scaling and covariance penalties are estimated
++        separately on each fold's training observations.
++    penalty_grid : sequence of pair of float
++        Candidate (exog, endog) trace-relative penalties.
++    cv : int, optional
++        Number of shuffled folds. The default is 5. Each validation fold must
++        contain at least two rows and each training fold at least three.
++    standardize : bool, optional
++        Standardize within each training fold. The default is False.
++    rng : int, array_like of int, numpy.random.Generator, or numpy.random.RandomState, optional
++        Entropy for shuffling rows. The global NumPy state is not used.
++
++    Returns
++    -------
++    Bunch
++        ``model`` is a CanCorr refit on all supplied training data; ``penalty``
++        is the selected pair; ``penalties`` contains the candidates;
++        ``cv_scores`` and ``mean_scores`` contain signed first-component
++        validation correlations. ``folds`` contains training/validation index
++        pairs, and ``failures`` records inapplicable candidate/fold fits.
++
++    Notes
++    -----
++    A candidate failing any fold is excluded, with a NaN mean score. If all
++    candidates fail, a ValueError is raised. Scores equal within 1e-12 prefer
++    the larger total penalty. Fold scores are averaged without aligning or
++    concatenating canonical scores across folds. This helper selects
++    penalties; it does not produce a p-value or an unbiased performance
++    estimate for the selected model. Evaluate that model on separate data.
++    """
++    x, y = _validate_views(exog, endog, min_rows=3)
++    nobs = len(x)
++    if (isinstance(cv, (bool, np.bool_)) or not isinstance(cv, (int, np.integer))
++            or cv < 2 or nobs // cv < 2 or nobs - int(np.ceil(nobs / cv)) < 3):
++        raise ValueError("cv must provide at least two validation and three training rows per fold")
++    penalties = [_validate_penalty(pair) for pair in penalty_grid]
++    if not penalties:
++        raise ValueError("penalty_grid must contain at least one candidate")
++    if not isinstance(standardize, (bool, np.bool_)):
++        raise ValueError("standardize must be a boolean")
++    generator = rng if isinstance(rng, np.random.RandomState) else np.random.default_rng(rng)
++    parts = np.array_split(generator.permutation(nobs), cv)
++    folds = [(np.concatenate(parts[:j] + parts[j + 1:]), part)
++             for j, part in enumerate(parts)]
++    scores = np.full((len(penalties), cv), np.nan)
++    failures = []
++    for i, penalty in enumerate(penalties):
++        for j, (train, validation) in enumerate(folds):
++            try:
++                model = CanCorr(y[train], x[train], penalty=penalty,
++                                standardize=standardize)
++                u, v = model.transform(x[validation], y[validation])
++                scores[i, j] = _paired_correlations(u[:, :1], v[:, :1])[0]
++            except ValueError as exc:
++                failures.append({"candidate": i, "fold": j, "reason": str(exc)})
++    means = scores.mean(1)
++    eligible = np.flatnonzero(np.isfinite(means))
++    if not len(eligible):
++        raise ValueError("No penalty candidate could be evaluated on every fold")
++    best = eligible[0]
++    for i in eligible[1:]:
++        tied = np.isclose(means[i], means[best], rtol=1e-12, atol=1e-12)
++        if (means[i] > means[best] and not tied) or (tied and sum(penalties[i]) > sum(penalties[best])):
++            best = i
++    model = CanCorr(y, x, penalty=penalties[best], standardize=standardize)
++    return Bunch(model=model, penalty=penalties[best], penalties=penalties,
++                 cv_scores=scores, mean_scores=means, folds=folds, failures=failures)
++
++
+ class CanCorrTestResults:
+     """
+     Canonical correlation results class
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/README.md b/statsmodels/multivariate/tests/results/ridge_cca/README.md
+new file mode 100644
+index 000000000..865b8dd04
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/README.md
+@@ -0,0 +1,36 @@
++# Independent R ridge CCA reference
++
++These small synthetic matrices were generated by `research/run_stage1.py` with
++NumPy's `default_rng(20261104)`. Their hashes and penalties are recorded in
++`reports/stage1/numerical_checks.json`. Each CSV has no header, full float64
++precision and one observation per row, except coefficient/result arrays.
++
++`r_results.csv` and `r_x_weights.csv` / `r_y_weights.csv` are generated by
++**R CCA 1.2.2::rcc**, using these exact input matrices. Python tests compare
++roots, Pearson score correlations and coefficient subspaces against these
++saved R outputs. R is needed only to regenerate the reference, not to run
++the Python tests. In the surrounding HDDA research project the regeneration
++script is `research/r_reference.R`; session information records R 4.6.2 and
++CCA 1.2.2. To regenerate a case independently from these committed inputs:
++
++```r
++library(CCA) # version 1.2.2
++case <- "ridge_lowdim" # alternatively classical or ridge_wide
++x <- as.matrix(read.csv(file.path(case, "x.csv"), header = FALSE))
++y <- as.matrix(read.csv(file.path(case, "y.csv"), header = FALSE))
++alpha <- if (case == "classical") c(0, 0) else c(0.3, 1.2)
++fit <- rcc(x, y, lambda1 = alpha[1] * mean(diag(cov(x))),
++           lambda2 = alpha[2] * mean(diag(cov(y))))
++fit$cor[1:3] # r_results.csv: root
++diag(cor(fit$scores$xscores[, 1:3], fit$scores$yscores[, 1:3]))
++fit$xcoef[, 1:3] # r_x_weights.csv; ycoef analogously
++```
++
++The numerical tests compare coefficient subspaces rather than coefficient
++entries, since signs and score normalizations differ between implementations.
++
++These are assistant-selected numerical unit checks, not the proposal's main
++synthetic benchmark or a generator with prespecified population correlations.
++Inputs are raw, unstandardized. `classical`: alpha=(0,0), n=72,p=6,q=4;
++`ridge_lowdim`: alpha=(0.3,1.2), n=72,p=6,q=4;
++`ridge_wide`: alpha=(0.3,1.2), n=24,p=40,q=31. Compare the first three components.
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/classical/r_results.csv b/statsmodels/multivariate/tests/results/ridge_cca/classical/r_results.csv
+new file mode 100644
+index 000000000..232feacbb
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/classical/r_results.csv
+@@ -0,0 +1,4 @@
++"root","train_correlation"
++0.847309489058799,0.847309489058799
++0.551817692527718,0.551817692527717
++0.367007974949997,0.367007974949997
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/classical/r_x_weights.csv b/statsmodels/multivariate/tests/results/ridge_cca/classical/r_x_weights.csv
+new file mode 100644
+index 000000000..a69d73406
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/classical/r_x_weights.csv
+@@ -0,0 +1,6 @@
++-0.971758658497845,-0.54675097066133,0.146633208437008
++0.415505317494483,-0.852479846362655,-0.0459430155141391
++0.138200953931459,0.340715211501985,0.508212456373536
++0.0259639497850817,-0.0479466878008139,0.602286694783551
++0.165130952357532,-0.00340567166156451,0.50355573687537
++-0.072921347255414,-0.313723091081267,0.187137335316324
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/classical/r_y_weights.csv b/statsmodels/multivariate/tests/results/ridge_cca/classical/r_y_weights.csv
+new file mode 100644
+index 000000000..28c60c0aa
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/classical/r_y_weights.csv
+@@ -0,0 +1,4 @@
++-0.0716608446681012,0.546299688605859,-0.428405063513956
++0.0858611534353012,-0.322657974957195,-1.06828649421246
++-0.201114729683805,0.554430102284773,-0.00829978467557302
++-0.487932284851737,-0.421674539667265,-0.0570621595472744
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/classical/x.csv b/statsmodels/multivariate/tests/results/ridge_cca/classical/x.csv
+new file mode 100644
+index 000000000..6ebf907f1
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/classical/x.csv
+@@ -0,0 +1,72 @@
++0.84109156598963186,1.5305117492821612,-0.24455876012441494,-2.0374936241443695,-1.3768043226490407,-0.82759247409491876
++0.6852540374510464,-0.46557820533335526,1.1282624644603205,0.12167005118134418,-0.81000242609824269,0.11971330829148055
++-1.801208751053655,0.00049638276507456692,0.085070439710644735,-0.19744179980345558,-1.5012207108850588,0.8661137493295995
++-0.31117908282127105,1.2090945329429839,-1.5135404120387377,-0.9297161925056372,1.0060747595948059,-1.1506640787074081
++-0.16175004079285951,-1.0910753518525391,-0.55618661590529594,0.92508027150137695,-0.40095465004394376,0.45911599254382451
++0.75239904669823399,-0.96626188771550825,0.88046542994987875,-0.41025480439824458,0.2709743168015511,0.75653310682485819
++0.44576729933730841,0.62851960531401485,-1.8654533862025839,-0.8581887867978043,1.1642761213422126,0.16403513906702713
++0.48858490034053653,1.4461722181911407,-1.369900412550944,0.63782921873922704,0.32700660536223575,1.045307315001988
++-0.72569777616816045,0.7210640721094016,0.54463334579790257,-0.42773649843142536,-0.50533927956484292,2.1952923571873044
++-2.2817439311748156,0.97733922048621313,-0.37860797565063997,1.6220695110337893,-0.61483132128354512,-0.10113970466839912
++-0.52884162028903892,1.0349528045670449,-1.9885609963412183,1.9592563347408842,0.55445831671514501,-1.7637095107176628
++0.23538223970697686,0.035685743880659239,0.095989352281992096,-0.35019138012333473,-1.3507514137191676,-0.10115275410949312
++-0.17270958637002931,0.26185001463126351,1.6671481222857993,-0.17580598303580636,0.27974657490780214,0.36020982615357822
++0.8015215147440079,1.189123696728168,-0.74899571925090835,-1.1070981755968821,0.44734054777422,0.1744700005985195
++0.54663577561379506,-2.0495481678944092,-0.87706668355296336,-0.97690104510539377,-0.017798109502058256,0.87392396094403491
++0.18627039160547423,1.050756369840381,-0.4080896677279357,-0.06834217925135351,0.53530747552288382,0.54475301738870829
++-0.68617751162695784,-2.1092716166089809,-0.85045295606780014,0.18732742326793583,0.75566106420590506,1.9374999489017464
++0.70292937713526638,2.3124084982701962,-0.64808294400984756,1.2996853035017821,-1.1677642160747641,-0.26948346017824815
++-0.80008646779219228,-0.3750427704198237,-1.8708583937633227,0.22676055778920554,-1.253071398423139,0.78380231906704978
++-0.51473629511584662,0.54007793004331373,1.1268338959836772,-0.48672172930485424,1.4352225551924314,0.9158985679338687
++-0.29528412411543487,-0.85234263826467083,-1.7198631186772075,0.91597369353161073,-0.88032652590383276,-1.8035191457254784
++0.62184440169877098,-0.033398233794493741,0.64578616703083269,1.2327068386518769,-0.010268712803106326,-0.57367707738389173
++0.3272361550091662,0.97281507534358991,0.82451025571659675,0.4369242488762039,1.7219685434426872,-0.60056635062693375
++-0.53894123881185907,1.6055894283828505,2.2990829576824834,-0.70719318852200008,1.5394113297526861,-1.2931722300902984
++0.4346351638705705,1.8371338111209297,0.75525057897283265,-1.4506854199358161,1.0778062044102004,0.71034975761902941
++1.3329202745583082,0.40550550062898622,-0.82962304631919359,-0.12797055312623273,0.49792299594006928,0.75261322759684368
++1.331709733203656,0.49897170954468129,0.59736273323667688,1.1419637231696631,0.34350973026139148,-0.37423900111041847
++-0.06192102887921077,0.75971416672451275,-0.88149769951589552,-0.23095759488175369,0.57025515558999917,-2.0337792102297811
++-0.77385995821438258,-1.920371760069759,-0.7872352885781585,-0.34287353974554424,-0.20917845026563917,0.82868317278027237
++-0.34876217263017084,0.50090460200063791,0.69753053966959344,-0.34480671354794562,-0.35849532046809646,2.9649670869310141
++0.38584501303726765,0.4500080463189553,-0.3118544915153546,0.86634224962001138,2.058189298550499,0.00057483679258076665
++1.7868878027866686,-0.72075905056510259,0.81698061833057611,1.7825239910791502,0.33554532131667847,1.4815503783615787
++2.0688414430822291,-1.0846755146462639,-0.1197092746100524,-1.6279702066813007,0.6715053793873953,1.4246329947831664
++0.22432953249790408,-0.4136287407608697,1.2443349766872986,-0.95183094944315727,-0.073377151818125513,-0.16251092390786909
++0.61718756365819205,-0.1096884204351339,0.12778207256537183,-1.1125768747070854,0.69468002502224557,0.72433365806643812
++-1.3086368247655185,1.7146008799168375,0.056175269300003453,0.27050237485461137,-1.821175656928856,0.34732043163967463
++0.66284085038144824,-1.3892706734969889,0.093009121443595008,1.1371474830498272,1.3342277547826655,-2.2467514599293095
++1.0542639809135177,0.86267154108842226,0.047061787638650862,-0.26377466417068118,-0.85643363267639605,2.3211371739239075
++-0.51466865615435542,0.40410017257213376,2.6001514901732743,-0.040629711965223692,-0.67411378635631847,0.40398734441584599
++0.20522913287644184,0.17453979526424254,0.20833522190039519,-0.66359251735607172,0.083232259817742738,1.0179940286000617
++0.75862483816871118,0.76568375358536445,0.033430961085680375,0.20910956756123456,-1.1852534449456364,1.4749359411647849
++0.75006399806953195,0.46571055021514207,-0.16697757474603955,2.4928123062851553,-0.21598765545193019,-0.53073932814873903
++0.49522083067140038,1.1365337634475909,-0.56563886761869087,-0.16997413545948009,-0.79171215946147278,0.67064648375858371
++0.33847481956520131,0.76072448283713767,-0.10379730327333257,-1.4701415162941209,-1.6094083261987442,-0.49069176822764843
++1.3350747570156569,0.17569335198517241,0.84000261529763953,1.5864301347042886,0.79545881523562356,1.2400557940814927
++-0.1600315445624759,-0.38244232586641996,0.65870049858305113,-0.23398752555065955,-0.79361692224222613,1.2087156421975274
++0.75754057990607415,0.59661718526567353,-0.20813434267720687,1.9255392239311238,-0.24661995754500843,-2.1413462324888193
++-1.6015317555528059,0.21876863970186555,0.28279605304620642,0.91533036532883338,0.12494436251597646,1.8409259406860345
++0.27870471463082208,-1.1709133463007138,-1.0758935628885207,-0.083971204313804448,0.14005833402022339,1.323939541593756
++-0.22254444888323768,0.70937190910398162,1.3181862409719389,0.11530363403587328,1.3252268414493942,0.56105867957323907
++0.31145216994363112,-1.239480253290671,-0.94617812307572124,0.96368201248622631,0.28637846406741013,-0.80311931027641681
++-0.40825734527952856,0.52549645935067901,1.4101785451833253,-1.9503233584489597,0.37062133784772022,0.30848234945719266
++-0.35043111538556621,1.3512698627866611,-0.18043213427199314,0.68946127284756853,0.056702702902787269,0.10007113596598509
++-0.65482251937956149,-1.7974635001429444,-0.13099065957073561,-1.019156546984554,-0.030394015714463048,-0.48370350423942854
++-0.47646406183335188,0.10540740689083644,-2.5030530200703041,2.1744599695352012,-0.26953046903811878,-0.23465943846942974
++0.89054976784397832,-0.19270759204972457,-0.9534403428417183,-0.40992033315764781,0.20306874772482547,-0.89112109429726694
++0.25107887673874418,-0.53894598737736332,-1.6976416964344141,-0.49605761673490506,0.46911366517062347,-1.3112706650394326
++1.429945451690614,1.0443794405149556,-0.20332578138444732,1.6805697162487059,-1.7357562409111156,0.63874082194266768
++1.3839661518789654,-0.89359894622655012,-3.0248200619376386,-0.36443894956012729,0.067200701590850551,0.74181155178664326
++-0.46270481952092052,0.3960317258071015,-1.3423671547730132,0.097176209918372516,0.30981086931209439,0.491676703169035
++-1.3794170507016543,1.5149352790113351,-0.90532120180443654,0.70308366670171141,-0.30850954210930664,-2.1599772457055084
++0.35517983039702494,0.91018024787869567,-1.7263030172467233,-0.20672518738419182,0.047001839217589922,-1.8702188850896952
++1.4075250658222873,-1.9884438841232543,0.85189518332743719,1.5114993039390003,-1.5751755101699685,-0.12835626339106918
++-0.44846372978389226,0.79612210710994646,0.89883325698519789,-0.85312657082309851,-0.50306940976627246,-1.1096850148473829
++0.15587663800477511,0.057570890822146906,1.1439982975445542,1.0762500595155702,2.4522764384025151,1.164148630800816
++-0.18117933582617632,-0.4006446695354936,-0.67785639389260544,-2.0638516927435671,-1.0334010123081967,-0.82486032895938188
++-0.69887156771752124,0.97377072667392883,1.1654892919584594,2.4313459524809446,-1.022265491317303,0.51973145583485558
++-0.7570756932959809,2.2332465466101348,-0.73794732752096748,-0.58833878016179675,1.3775213116220066,1.5919975961851622
++0.43622398024740122,1.4468438671095105,0.49400382021874445,0.78717496307107471,-1.2873346966316135,1.0639759892102925
++0.031244706664141773,0.063292476168503947,-0.52133536441720507,0.31623318744398043,0.56237548781699764,-1.1464102020456148
++-1.176858989519308,-1.2862678834365777,-0.95205372507521524,-0.10995149925527815,-1.700209001727506,0.29913084165487996
++0.64221834990914906,-0.72599741642887228,-1.1847337189176397,0.56336086025508036,0.83632938425689973,-0.85314421230485193
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/classical/y.csv b/statsmodels/multivariate/tests/results/ridge_cca/classical/y.csv
+new file mode 100644
+index 000000000..8c08f97f9
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/classical/y.csv
+@@ -0,0 +1,72 @@
++-0.079712231607710016,0.06831780473863952,0.41940824142090083,-1.254542077610433
++2.541996782972765,-0.59236476294821838,1.111443046361376,0.89866885360997395
++-0.69571388112925325,-1.2273749829771641,-1.5729036502948546,-2.3130755705774342
++0.49117660326651846,1.1702084673048891,-1.0304847224266847,-3.1022925555970855
++-1.1047422706489369,-1.1516272880925673,1.7397000141065166,-0.64394542857125103
++0.59131572952017575,0.17060418495383239,0.87909218371682729,0.74356131838347528
++-0.37474201259198936,1.2504002971616575,0.22796148997329135,-0.26703949175783198
++0.26983073339125119,-0.89291118619927878,-1.086987251198545,1.1821437450945684
++-3.1023865147134737,0.3416320061648791,1.9419552116972467,-2.1759958748390642
++-0.79391230442759397,2.226799751776221,-1.596543534996028,-4.8798124159447989
++-1.3375986807796159,0.75291576089233381,0.49666722377986466,-2.8500911342639759
++1.1056459863574923,-0.28137703531217612,1.378246030730693,0.98309535311346408
++0.023998738397456351,0.010705821802081128,0.060128708083859228,-0.54923656283169264
++-0.77366649336890814,-1.263156785057139,-0.076025830884236201,0.60925005345409711
++2.486256563588062,1.2527116488398302,1.5536657440255421,1.6024983011443359
++0.063191896881698906,-1.0603296360623282,-0.1370691537105804,1.0736169600782999
++1.1228488279648667,-1.0731646023326704,2.7147861735428922,0.47725840498168615
++0.78509075157218366,0.80620700079058782,-0.86455190018538641,1.8756501937227241
++1.0306603259390947,1.2809553740418207,-1.684922881491729,0.17302889999857896
++0.5610304424090935,-0.19875920597224411,1.1107885795935486,-1.0000294325956043
++0.65943701798980037,0.6094797420623066,2.6085637067973488,0.29537013864424094
++-0.20794743252946626,0.11690048819656998,0.79673780491803692,-0.50171332922868939
++0.84812323294524306,-0.033715079526862174,-2.1763590157011019,0.14922565671381754
++0.58906546958999484,0.58474810207457839,-1.7075782808942952,-2.5417067441234797
++-1.4687290778665618,-0.33540703704604979,-0.78367129277817726,0.85428978556843804
++0.59792469391036096,0.16913140412797323,-1.0384834881402139,2.5550570063173046
++-0.1048147790811178,-0.24152774518438724,0.54776875291281846,1.3253031817765182
++-0.79892504505333006,-0.49433185213039404,-1.8926260939343542,-1.0440712939737342
++2.584085366446673,-0.76713732164264736,-0.40844279577110809,0.64158334391242522
++0.15963745958332307,1.4215719745689936,-0.60021597229062196,-1.9039738071086831
++-0.42874505563623166,-1.3465729651440657,-2.2380874633758427,0.15554318164873618
++-0.15093605013987965,-0.55971768044483317,0.63172146331493728,2.7329977788014479
++0.066227117374307698,0.33221570508014298,1.6006382118860791,3.8564278692161302
++-1.0797981708684974,-0.2214926355463066,2.2411668570263013,-1.7335105995361473
++-1.9378436873449527,1.1093935424971251,-1.2691746682474312,0.40717071058650095
++-3.1176882633405807,1.6980375861619481,-0.82788716397635598,-0.053440040559069146
++0.9076451715315933,-1.1175266457322715,2.1415579000566596,2.0567014303364317
++-0.20903446118117225,-0.32790222993145257,-1.3543148119891839,1.2639810645126306
++-0.80939619494210169,0.2473993345168671,-0.64195808380355068,-2.8009960623526573
++-0.50884431589476797,-1.5282906307655009,-1.3528662074373765,0.38696018337451915
++-1.1740216047427969,0.083707261018337809,0.15894287733641982,0.25619069208379824
++0.42597598069934861,0.37308977056198794,-1.1577902124136112,0.99547614281611763
++0.89896065081926124,1.1646685873116076,2.3111495251608454,0.92209928401086827
++-1.1984804969028233,1.0423331372864411,-0.80095710986249213,0.85957928664775141
++-1.2701804482734951,-0.79052466504890773,-0.33565892627459876,0.33967188592776631
++0.8627025042209302,1.3173206013998351,0.41498397011408772,-1.2182095049741322
++0.56253962492762444,0.35953025046235398,0.26176156639327941,1.295295043494713
++-1.9941390057295569,0.58851051825310863,0.1328746096837406,-4.4352614371622767
++0.26822962873662576,0.32185843912961642,2.365222932242748,1.8967960087476681
++-1.698711990106617,0.34531325995818146,-0.98997329482952612,-1.7353158574142853
++0.084343632381632838,-0.95227126855572153,-0.86768363790127889,1.5906850969162485
++-0.29357696300636549,0.91571869516038618,0.044425614920834133,-1.5310224986461631
++-0.18389908195163118,0.84749884210568927,-0.045856034170807913,-1.5740093722787383
++0.14010961563971502,0.44901289918441245,1.0093090089264845,-0.53016032772330035
++-1.0759086458937979,0.51317753462209503,0.19595082358537252,-1.5410088890829596
++-0.0035133562001994356,0.42160040525259418,0.09392504513776595,-1.3788301514975514
++0.076643438359231264,0.31896591942610297,0.56142948413314275,1.2562385605574038
++0.84077006288048606,-0.30739692745045866,-0.092486202393620154,1.3611767138656201
++0.89161449348683863,0.39997330616414595,-0.4191763377863908,2.5151194862040223
++-0.81000551106850105,-0.021655112422722778,-1.0491380571051461,-1.7835648010228002
++-1.6697261468434856,1.5270937568643572,-1.4839167820818653,-3.7576759066759369
++0.97559570662529316,0.10905749020461161,-1.2017755435370991,0.56449975959144583
++1.1777541558059343,-1.4853350422451066,0.99224972891158547,2.3746309351856572
++0.88213722384605076,0.12397455729942232,0.54329463423243207,-2.271764846861005
++-0.43629075079634599,0.34113193327993363,0.033571744422141586,-1.4381549959059996
++1.71324983758175,0.41334793079481585,0.81409095744021664,-0.3894263500377404
++-0.54808287483709939,-2.044966061146066,-0.11160505652253927,-2.2630685587339996
++-0.59961700973925836,0.70805663421931841,-0.7665790974859823,-0.95244267777808778
++-1.4947649440442872,1.5827660403335631,-0.33727461472327996,0.65380998968630988
++-1.3945976133466413,1.0607902786617431,1.6236879576450158,-1.0187073705189658
++0.81771957495231784,0.67143519628900683,-0.092720128833535309,1.2749086199556936
++1.3825611287050534,-1.6745524075905327,-0.43988402207327659,0.36301009641488413
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/ridge_lowdim/r_results.csv b/statsmodels/multivariate/tests/results/ridge_cca/ridge_lowdim/r_results.csv
+new file mode 100644
+index 000000000..9f0e76d40
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/ridge_lowdim/r_results.csv
+@@ -0,0 +1,4 @@
++"root","train_correlation"
++0.676598360040551,0.916529924754416
++0.326983054116391,0.655025634645517
++0.101948942173919,0.240555817204416
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/ridge_lowdim/r_x_weights.csv b/statsmodels/multivariate/tests/results/ridge_cca/ridge_lowdim/r_x_weights.csv
+new file mode 100644
+index 000000000..b35e0f500
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/ridge_lowdim/r_x_weights.csv
+@@ -0,0 +1,6 @@
++-0.224028030920477,0.819483071274644,0.0673300152405199
++-0.756667581935017,-0.197252432570343,-0.048765390488571
++0.00685163470779925,0.0220972916273402,0.673753205496988
++0.0214939908500574,0.0911824057290683,-0.578883972880042
++0.0245371117968475,-0.129945583750459,0.0829737584738012
++-0.0614192605600408,-0.0695519250286685,-0.0594756711705712
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/ridge_lowdim/r_y_weights.csv b/statsmodels/multivariate/tests/results/ridge_cca/ridge_lowdim/r_y_weights.csv
+new file mode 100644
+index 000000000..cf941a2b3
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/ridge_lowdim/r_y_weights.csv
+@@ -0,0 +1,4 @@
++-0.235160638097195,-0.21498824895934,-0.101533586469206
++0.142961333927566,-0.397786008214553,0.199122599018164
++0.171838223711346,-0.0405685317653751,-0.436584466211074
++-0.0984662159781099,-0.198226425966264,-0.189420905271713
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/ridge_lowdim/x.csv b/statsmodels/multivariate/tests/results/ridge_cca/ridge_lowdim/x.csv
+new file mode 100644
+index 000000000..495e7df56
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/ridge_lowdim/x.csv
+@@ -0,0 +1,72 @@
++-1.9535249438982958,1.7120435079480567,1.2135126155801048,1.0396662112924082,0.56122277813275245,-0.58459728682242018
++0.66205046197299067,1.1616678777335729,-0.14996689098524238,-0.55892096324668095,-0.49334099227342465,0.22279052223455179
++-0.12324135453198162,-0.8600698287380858,0.12334483338994921,0.31796909527689277,-0.11392689150408239,1.0979630018755167
++0.92301848001271047,-0.028275099459041705,2.0951566071623504,-0.75204257412676523,0.44046426620273282,-0.084239171373121591
++-1.6507207182876393,-0.57391535446499253,-0.23839394931456065,-1.4135482068970691,-2.5135756610992606,-0.89630697876872412
++-0.42974308300894704,1.1351997285778135,0.5079051599980392,-0.84620800275743013,0.61750453509059311,-0.19435354685136766
++1.6194334563822186,-0.35393608403726362,-0.2365319896432006,-0.083038334800802457,0.65607117008809734,-0.25096584085481666
++0.04725369065599673,-1.9553058665812595,-0.54828766401320261,0.91527031383029867,-0.13654257015832677,-0.29309148575853272
++-0.34770387987944074,-1.8957109814004129,0.91841893781767048,0.29511852182284659,-0.25919486685445209,-0.76058822970204232
++-0.61168464523451027,-0.013863926098195974,-0.37941368080945698,-1.02417375799843,-0.28128004192416711,-0.73337167864131747
++-2.674388645150616,-0.44461298226885598,-1.8820206556902079,-1.4336882497793066,1.4313267406537631,-0.70514054775907609
++-0.36123112613326336,1.6607522025554688,1.239358571473069,-0.37952070825415479,-2.0772571046646373,1.0411892336953685
++1.39890603075898,-0.96421307780704935,2.0880504317397359,-0.57660903190601531,-0.17947307436859694,1.435962582398199
++0.47943286901766458,-0.24238437873446408,-0.48414606199926075,-0.076238103779338651,-0.16581503051698745,-0.51642440118699251
++0.17627900424808082,-0.49362871045493645,1.219875782243141,0.15695261306754141,-0.9569667393289023,1.4627434055587134
++-0.40704226295756868,-0.80339120287327059,0.27534321712224974,-0.46466916783425183,0.59968712076619979,-2.2606356713965368
++-0.50988580158967556,2.2504038349799385,-0.028063559308087078,-1.379334918937781,-1.5564286403087479,1.1659416731780976
++-0.38429842645833179,-1.5257826813894557,0.46687611328955053,-1.9197324292574771,0.46236925616309515,0.42079789748492519
++-0.34687942231373553,-0.46460156987238616,-1.3394662340182177,0.4577553672441122,-1.0127271316503801,0.8697723655786872
++-1.2912488876620769,-0.98367332402273389,-0.70386070638394038,1.3517364173823241,0.68634911456261338,0.63235216572155861
++0.65704093696564325,0.90129637567270471,0.24632571474500753,0.40145661617070538,0.60580837575352031,-2.6018811653759295
++1.9091045444992985,-1.0940724723084747,0.14289182215203275,0.45839900031614261,1.2122989126662251,0.94172342641657625
++0.34768940924133745,0.59177258638046981,0.12107605874846443,0.21814279759276245,-3.0848986778386842,0.7911440319065749
++-1.5085133248674059,0.32607285598226937,-1.5935590846465619,-0.61249240780101855,-0.37455878675031734,-0.41651985214748738
++1.2626516926180216,0.16306387816804235,1.4089532763294135,2.1371691889089282,-0.69566368726924688,-1.3614042844837366
++0.84722799459175513,2.5927823111211237,-0.12314804777176387,-0.60296866802486526,1.6405918028406092,-0.52034323408033756
++-0.24759289606864096,-1.3572945500211531,-1.0495313976197469,-0.23932908182438056,-0.34294377128595899,-0.80157422610696405
++-0.30256328203596766,1.2186829903328307,0.19156650835974406,-0.21578099749991464,1.0733862375404313,0.14637854703977418
++1.0113151803687488,1.481940736413669,-0.50461276100954855,-1.4601816948361195,0.11335866420263542,0.54499302063915389
++-0.58437006693704718,-0.17427970166149179,1.042180549158414,-1.2696734935839351,-1.0097180490869213,-0.64006713855831832
++-1.755265137574255,0.35459466990196847,0.21105358386711273,-1.5577930262554225,-0.16636614837003141,1.4232398608666597
++0.52848039633088317,0.29665433804625313,-0.24412933994815758,-0.58936500827592464,-1.5741742215958867,-0.2213782777107676
++-0.82502201034344347,0.48170424308670706,-0.27233064961826015,0.40045013562812926,-0.96540290487708602,-0.43428072310776905
++0.3602347304516928,0.9530698467025196,1.043144069816931,-1.0991141477058368,0.34664365575872419,-1.5059025980887539
++2.5284241974296742,-0.89671993380836446,0.043170772047565295,1.1782354612371033,0.16533506651866017,-1.410433505333283
++1.1087553873634743,-0.013774414513996299,0.4957760994353918,0.067805566223308994,0.47106770192880715,-0.61001996673125913
++-0.3654430033771025,0.44025592544870273,1.1007145746265041,0.27376098580250408,-0.71953461344718384,1.2124115860346596
++-0.62177123585564498,1.9630297209719045,0.17703664692428406,0.95816655306277898,1.2302096850881457,0.71263021821814476
++0.5282603023476049,1.3188393438134911,0.4714370282301994,1.7474445521149329,-0.38906006536439569,0.054951785696734763
++-1.4404264591493277,-1.0808548573460559,-0.47597867908616215,-0.15180872948522739,0.76126000087242507,0.56866433112722869
++-0.19065226569898494,-0.70318805943179052,0.16112783265860736,-1.2133816293736803,-1.5932231027741766,-0.38518052883018522
++-0.78971505092836569,1.5345979075922662,0.54905243154151595,0.060832417284003557,-0.88372421053420702,-0.4035715082857555
++0.79371675352415272,0.86208063528799317,-1.0702612330940886,0.67888307963831773,-2.8982284460860015,0.25380306001234942
++0.66615679772072167,-1.7666880949009394,-0.71829277278505532,-0.70364297361249195,-1.0312878104884156,-1.1631463690407104
++0.06068871999151132,1.7720278869823174,1.9007536075339955,-1.41995378647618,-0.58400802317833511,-0.85001026944906155
++-0.94157117671498325,-0.28998598901888434,-1.3340516321736506,-0.4941871277790657,-0.34706793600956337,1.6077070764422106
++1.4756530579713452,-0.079676512302664773,0.63458043786857166,0.64409447368242645,-0.040505001283974544,-0.52827745407230375
++0.35763124836202137,0.6235562632288012,0.57004637753499399,0.6320968656170094,-0.8635967546299449,0.1948723501325425
++1.2848146243411276,-0.21076674595634534,1.1288775477991082,0.40567849432466685,1.3361237996866246,-1.5558229257829208
++0.70780985568718713,-1.2833204190488847,-0.60146181755445638,0.32313787337855171,1.6328937745215717,1.1064012085760921
++0.659193158612977,0.28329971622916023,1.2121369472352428,-0.42690433721757798,-0.66210754526921545,-0.022406839193235814
++-0.59257456985075185,0.38978427224517948,-0.084069162602292871,-0.065556551238343211,-0.93787706244535951,-0.5862810200993942
++0.54770247036021935,-0.57449493688894604,-0.49982339959591077,0.5201951312998635,2.0560144740373687,-1.0396605520032751
++0.37049101041439625,-1.158852561996299,1.3776074253042265,0.3448166430540715,-1.0761867469621109,-1.6346781715941499
++0.26648439222541387,1.7795654211553207,0.5221534522398229,0.89904981608573908,-0.53822960544658194,-0.30234333981475425
++0.09376710824208298,1.0699971252940563,-2.4667959458282493,0.12962553846746891,-0.12247841846815229,1.6431134867214907
++0.27371001133283884,0.18696426906585378,-1.2803877559692685,-0.99366438750216313,0.85410894628397793,-2.3264968258706
++0.064256234930703177,-1.0130126494264022,0.68828686370405723,0.33351953176319066,1.3303844059797181,-0.71978839785835325
++-0.50296192276762419,-2.162572946504798,1.099780358078047,-0.30832865795989711,0.38867748850154116,-0.12700050255688697
++0.53555299371759968,-1.0684535861502134,-2.3458574170994519,1.3503385579129781,-1.1379401323546376,-0.6659195286221804
++0.89809236953163063,1.9811399550392261,-1.1994921082274244,0.053474044347080009,-0.16059314661155899,-2.1443651941561286
++-0.98534461783449623,1.1013831844449398,-0.070172308944993794,1.6075858304992476,-0.43991859538956296,0.42284064548669964
++-0.77063070699793057,0.89055655779586618,2.7255634736271288,-0.067829340332994148,-0.20962907063252026,0.050800213155069877
++-0.98706003794499075,-0.4924540224966788,0.69964755608921358,0.89388806179498637,-3.1781145343181882,0.2015460523036135
++-0.48921215874696927,-0.26007287502009369,1.1531351246306307,0.46214335791002553,0.80922755242451605,0.11159029593036593
++1.7125074143598014,0.64419632098709456,-2.2942389187112879,-1.6037550247385681,1.2328067223420285,-0.88803703132683787
++-1.5911727117155794,-1.6795352380802173,0.62991313722746933,0.0043662669958723418,2.8857258845699052,0.49757380494430936
++-0.63144930235245511,-1.6711627427049107,1.4683505534218018,0.18535396914035454,-1.1767563019229073,-0.14837707409084405
++-1.2600137057374312,-0.47104332109696939,1.0150885628137347,2.1372445266726903,-1.182971051327522,0.44750677886025686
++1.2422441310901755,-0.73228046872928543,-0.33220723537127933,-0.88754633642270786,-0.98263438630854527,0.7270314735973068
++0.58383361384521748,-1.0771156619092555,-1.4405711102097536,0.56505186866737644,-0.11274625281599152,-1.5475033328669265
++0.4015893898359546,-0.53673821506084607,-0.59944250295658763,-0.28713740630790524,-0.88677636311116315,0.031207635422876127
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/ridge_lowdim/y.csv b/statsmodels/multivariate/tests/results/ridge_cca/ridge_lowdim/y.csv
+new file mode 100644
+index 000000000..af4b8979a
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/ridge_lowdim/y.csv
+@@ -0,0 +1,72 @@
++0.81637071268371186,0.16305978193660917,-1.577146854124901,1.3557706200902744
++2.6171062007277053,-3.5923830456947989,-1.8219526939860111,0.25769148083661036
++-1.3976381924105943,0.0084410473524307861,0.048241772583706988,-0.99804153834611986
++-0.25545801512962429,-0.31561867608386585,0.67622321444554656,-1.5533685420580854
++-0.62990115879761976,1.8672505612243682,0.68930515566443629,-0.34933727643932416
++0.6958326560937903,-1.8603782617245908,-0.45515750564523189,0.36020128622396708
++1.1903577814627042,-0.94861189155049774,1.5365723552564972,-1.4599205080003421
++-2.831194363609054,1.030126984740193,2.4337437869559753,-0.4384380296214303
++-0.49313211087811393,-0.19377799124358397,1.0011693619207764,-0.51931715142597945
++0.26786394869905139,0.52893235629923818,-0.24535468936911536,-0.21335056566541841
++-0.35013518537459376,1.1063067997429425,0.86268972695872936,0.5264463497343459
++2.3144597863505365,-2.5880211859598665,-1.6648409914231905,0.40121383724409776
++-1.9364378813161194,-0.7921485785905128,-0.95091573136483498,0.11960998709784665
++0.30958627545249229,-0.23107953037668644,0.12768651385160368,-1.0941860015801437
++0.60942816248483889,1.5702606383327866,0.56256633191836525,-0.34898128179613497
++-1.3239657054638707,2.9265640025802031,1.6537707661207288,-0.4101354163973418
++2.301141954401217,-0.41731265321149646,-2.2724960868681259,3.4796594863469763
++-0.54678968946608353,0.62528782589096987,1.9942883300891308,0.54680017032966599
++-1.4204896030531351,1.4790201988893048,1.9493370195570514,1.9034364569672402
++-2.397450816750244,2.1632364295068092,1.8205196886529347,-1.4759520458605886
++0.66596470927817819,0.96283826757054691,-0.0066962176191138756,0.51654526732189676
++-0.87819758684161475,-0.72885270999160545,0.037895430120902018,-1.8136576302737495
++0.36909050305681818,-2.6566486786802335,1.2274015286681199,-0.90435254646788588
++1.0076885139291591,0.63938839443672024,1.0120660901988132,0.096172697600163226
++-1.3867577325649785,-3.0348768462923656,-0.6573569722661885,1.4195049841222731
++4.3823918749544859,-2.0775733269342296,-4.3855947113470801,1.2059176884274359
++-2.3981465813303133,0.83015410056044203,1.6918824369713248,-0.51756352748258017
++1.0474249218830147,-0.19363384906910719,-1.4130490171344716,-0.84925523134943692
++1.6128866850381562,-1.5917133380659145,-1.75991181921231,-0.10049192203405011
++0.060344885449245211,0.1240214388615789,2.0376556459640986,-1.106443702906136
++0.35213519231301393,1.0280294855829715,-0.44774303432200835,0.16594419029543717
++-0.51733049726535074,0.14490880373465831,0.53973945223952491,0.31144960986774484
++0.042186385057467579,-0.066176451336411701,0.35741231593973133,-0.76301830092803036
++0.84883534719772458,-1.6559198327628417,-1.5108535084160835,-0.089185792208338888
++-2.8700524539660801,-1.0805971221899977,-0.14280549139779347,-1.5398607968565732
++0.84288992335887769,-0.83309367449716953,0.73171261577093416,-1.001991066048642
++0.49275610443182039,0.032731228956766237,-1.6050833767491803,-0.15213072038347664
++2.3192134774581077,0.064716753200742883,-1.4339772994842763,1.9480676079584953
++3.7391310349179716,-2.1900514433872846,-0.4956133361866123,1.0792803351463376
++-0.75731862245278991,2.9506817526617617,3.5105691480783827,-0.73735903195998587
++-0.75596184220445928,1.3411751567151482,0.22287099830656726,0.47930398192905366
++0.67127925113733689,-0.69556277701467062,-1.2553557567721616,0.99015381878778952
++1.7689554985274127,-1.846815407415594,-2.1201873435587224,0.45227683698696031
++-3.4156624961044306,-0.4057031762928448,-0.1162310054437723,-2.382115769214995
++1.7969358261486155,-0.46408884311478682,-1.0192731569833966,1.2238940419867039
++0.014490926866114862,0.49514079900774155,1.4288164178203013,-1.6991565488820424
++-0.60008794124431186,-1.3469505533371504,0.18355249727646628,-0.71362887586256873
++2.5793303339251024,-3.2171831598843097,-1.7822955467712265,0.91043737319615969
++0.35970001471757501,-1.5282886966650526,-1.5604625016121032,0.29203334494461664
++-1.2471376083955659,-0.81972006474656911,2.5222232512781244,0.036222847388915458
++1.9557780044796176,-0.33275968459065502,0.71804315842451205,-0.040393428097652638
++0.10312811540209343,-1.0200887073842184,-0.20820683268389237,-0.45486656545031545
++-1.8689503517321695,0.64327136738785473,0.68647092353842354,0.45987286636948577
++-1.0604391302326235,-0.51116967690652859,-0.42782251729972209,0.47010532807305938
++2.4299727674599456,-2.750156394877167,-0.64741682312027327,0.0068275414078811103
++2.197571706336154,-1.0199656673587105,-1.3015802750361423,1.1692522780858097
++-0.25568615948797524,-0.58324480432053982,0.92104972200352242,-1.7442815666984237
++-2.4863360027184549,-0.3053668391218356,1.6616358036838972,-0.60629125661293426
++-4.3713391903158385,2.099266516485192,2.6493599658077147,-1.4029138997028356
++-1.0150617508530935,0.22227249575164398,1.2223423963735611,-1.4801950075504537
++2.9823441077934385,-2.1993274010794819,-1.6369927663693729,3.2927900867462885
++1.404550799599982,-1.6421646319667209,-0.63727168791593725,1.3281341120414141
++0.42424982597052552,1.2287193021931129,-1.2039588968715265,-0.95105326030159965
++-2.2098180506438609,-0.044233209108692106,1.6145604052533638,0.55430816244627124
++0.28164366184644807,-0.35312284989047282,0.84261673649414748,0.11781029760922065
++0.47835283941152373,-2.820438701206549,-2.4415182655468648,1.3342035015557712
++-2.1323339898298643,2.6501792345191335,1.4652604690168909,-0.89533473296338462
++-3.5866829902697845,3.282474559091797,-0.76019116152684574,-2.6324974640628414
++0.42799951284005699,2.1767039302021245,0.96824561184051594,-0.4292836677753471
++-1.4966878478268075,-0.86931066438962756,-1.1166203438699034,-1.1354233587196849
++-1.6913493668961945,0.38425680425832759,1.5026273540069242,-2.0987487565690115
++1.2089548630547866,1.3800024341922055,0.13099597578950095,-2.1669469968191128
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/ridge_wide/r_results.csv b/statsmodels/multivariate/tests/results/ridge_cca/ridge_wide/r_results.csv
+new file mode 100644
+index 000000000..bfd3d98eb
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/ridge_wide/r_results.csv
+@@ -0,0 +1,4 @@
++"root","train_correlation"
++0.883840677642131,0.995765084245593
++0.834938760028468,0.994292908899965
++0.657781465772453,0.991624399388111
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/ridge_wide/r_x_weights.csv b/statsmodels/multivariate/tests/results/ridge_cca/ridge_wide/r_x_weights.csv
+new file mode 100644
+index 000000000..466665e54
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/ridge_wide/r_x_weights.csv
+@@ -0,0 +1,40 @@
++0.51953269506021,-0.0546775934530964,0.190093463451344
++0.133723793881955,0.488953438557061,-0.065586422390415
++0.0894557143387172,0.0850932676441721,0.11002476325215
++-0.0201195249317621,0.0156226851280362,0.0615526389592538
++-6.40464277671653e-05,0.103411257402404,-0.161974525306728
++-0.0442665936964886,-0.0828311491562381,-0.101172105709252
++-0.00995182961186476,-0.0872494349833043,0.0391206152011832
++-0.00125151404456844,0.0165712347081047,-0.26101033120155
++-0.0011993093172923,0.00814195648023324,0.12006410952501
++-0.0762749376878027,-0.0868322443125075,-0.1969096959298
++0.0623002305122303,0.00898067078177711,-0.0396204874527753
++0.00237895596283311,-0.0420875395295741,-0.114546784861042
++0.187693971588402,0.0218238779077473,-0.134484177427721
++0.0416077878708481,0.0193471755739484,0.0337009610036727
++0.0325717898295995,-0.0785103351991252,-0.0820606360384617
++-0.0484792769674552,0.128676903741219,-0.113297027322402
++-0.153065727796231,-0.0332448496215323,-0.00975125344037325
++0.00917281549298617,-0.0355793919043731,-0.073850052350515
++-0.0111875204314756,0.0315181567834703,0.206846900008863
++0.0362908987483915,0.0341703156830657,-0.0529406099543983
++0.0275817912650533,-0.0199200684632721,-0.0285736585268196
++-0.0552782897226447,0.109393878816817,-0.0886469417439859
++-0.0527466474077559,-0.15503564256287,0.0541884835231979
++0.0698399168625315,0.0416127333412006,-0.113209529004183
++0.0126087856884036,0.00815154576699484,0.000607986199048312
++-0.0748949404712688,0.0464644180424162,-0.160518390825512
++-0.0686696906036415,-0.101892819770717,0.139463795368024
++-0.135571714705475,-0.0442493697230401,0.00309002566683217
++-0.0654017940636414,0.0918326095051911,0.260074874159045
++-0.0676757287093852,0.109229768741029,-0.0360277428642101
++0.0593737836605365,-0.0836656959375179,0.00753695549024584
++0.0209912516265414,-0.223972268371827,0.0151014948906474
++0.00213964583611428,-0.0446871920876669,-0.241512464591303
++0.141940198886122,0.0439274624584483,-0.070051113321719
++0.0116316870619862,-0.0124338340388796,-0.0341878638912957
++-0.017045830781801,0.0372957734390068,0.0804270394504688
++-0.117720191069581,0.116005385183588,-0.108833644153739
++0.0996594970552079,0.0771810011708789,0.161652470762387
++-0.020123720982353,0.0263633747704339,0.0860908398155792
++-0.0128992654332102,0.0240312521843727,-0.0243863592202962
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/ridge_wide/r_y_weights.csv b/statsmodels/multivariate/tests/results/ridge_cca/ridge_wide/r_y_weights.csv
+new file mode 100644
+index 000000000..e450592fb
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/ridge_wide/r_y_weights.csv
+@@ -0,0 +1,31 @@
++0.0261286031330703,-0.040042073255136,0.0734797348166555
++-0.0382260628604727,-0.0286399137183012,0.0603721125940809
++0.0353892285205463,0.0184119310137286,-0.020690429058323
++-0.0190272720154163,-0.0147442392145744,0.0539209260130536
++0.0340060650421213,0.0119232382211278,0.0450888289609733
++0.0180367921771328,-0.0415537780533118,0.00724908404253797
++0.011379191765601,0.0494538872784204,-0.00118845663085273
++0.0329389001867148,-0.00932358731226111,0.0636716199061558
++0.0135888076049853,0.0658214858023606,0.0967029201564751
++-0.00211444281634663,-0.0152706165491525,-0.0647629204118078
++-0.00442291470523544,0.0323487290639207,0.00613174360787856
++-0.0550452586118548,0.0648189576722532,0.0580116031513439
++0.0230005982760147,-0.0639023249193026,0.102583893032572
++-0.0576269219142839,0.0597530939077425,-0.0066040216133603
++-0.0468920482570669,0.0277334009550373,0.13718169082738
++-0.0312059320913944,0.013218217607485,0.192662314710891
++-0.0106094341780735,-0.0158870653128727,-0.0255712362726934
++0.002824820153144,0.023473565913317,0.0413383048122902
++-0.00435976186995962,0.0297260490812227,0.0682415141801484
++0.0249203625581161,0.0471132647427807,0.0833151759641026
++-0.0416342641482587,-0.118092432535911,-0.0223071721508403
++-0.00299624751702258,0.0155853173737233,0.0496842957743107
++0.0282965773957086,-0.0635156358722104,0.0152791024324017
++-0.0241715340180322,0.0299144148028072,-0.0131671428581362
++-0.0177643002905825,-0.012823369939253,0.0790822952500013
++0.0174624691955088,-0.042967240974601,0.10574765832907
++0.015482259414038,0.0707529594959562,-0.021175571168705
++0.0161223041499326,-0.0103850106659525,0.0691078233536291
++-0.0219755016944827,0.0172703549454823,-0.0324782702693137
++-0.0546646658035844,-0.0156876138705197,0.0700990996477244
++0.00951108032931996,-0.00442978871765721,-0.0355758535896792
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/ridge_wide/x.csv b/statsmodels/multivariate/tests/results/ridge_cca/ridge_wide/x.csv
+new file mode 100644
+index 000000000..45cd84752
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/ridge_wide/x.csv
+@@ -0,0 +1,24 @@
++-0.45934434725858159,1.0230417334896607,0.69419756465173565,-0.29440369332852101,0.86100403865775699,1.4165768150535298,0.15224526892995341,-0.72545215571771138,0.10434544101068949,0.90747026460707836,0.13893713219308515,1.329605074269506,-0.44358017337987721,0.60845471554398844,-0.9263575738062344,-0.26539225672306904,-0.20494565854137345,-0.29278367811015199,-1.4906818837022875,-0.40650559158522898,-0.64205699063653832,-0.24329303517118003,-1.1791211970330673,0.08884375518830831,-1.5065035043078916,0.091669090902096406,-1.8245119633260252,-0.39777027766065798,0.77632991023978504,0.60440130043350193,1.4693511640804651,-0.22131664842416085,0.035668864085574313,-1.2794273599925272,0.44125960818002102,1.2701196127777403,-0.84259651071746278,0.89577885391792478,-0.77023908857899204,-0.72481005864835224
++-1.2322749170588263,0.45153841654135357,-1.3242942057057558,0.22920126352612563,0.096605439510162386,0.090824843215413759,-0.38414109158886633,-1.1992058669091423,-1.5764165627479287,-0.41433289247866628,-0.72208654245101545,1.3689670351067911,-1.8562416022378023,1.0709111805850744,0.27241414663364666,-1.3409870863718458,-1.6017742694438268,0.33242732273618697,1.0925588680778171,-0.93718051540543656,-0.073608050860328067,1.1452029784505939,-0.65731616886881772,-0.69704985340101766,0.31094001345402073,0.69930356688991735,-1.3041862522684509,-0.95394024546805356,2.1664017689968103,1.7326050143147851,-1.5265573016369292,1.6164579780534685,-0.14407074174662637,-0.76465689055955843,1.2685508039360933,0.26763970028961948,-0.2779308736722419,-0.68054693768053043,1.097191724545119,-0.65597441489409603
++0.73027834063873687,0.88700375572438395,1.9157182047764758,-1.0626716451055276,-0.77162475463030777,-0.28479218757771274,0.88618350351169706,-0.7116178341414563,0.6453885706886896,-1.7343981115602625,0.18698050957585957,0.99940189642425115,0.33483696601685764,-0.21638894943181847,-0.22991712283851443,-0.51673258906268327,-0.97810216534773553,-1.3072968851614428,1.0911811561561964,-0.65050450460868903,-0.2518401927027144,3.5094197480302394,0.2765148579261742,0.42079044272997418,-0.58262377770874019,-0.30144475150626132,0.20413009269946042,-0.5054290061545591,1.6442132961470486,0.92181313038283808,-0.64003671090761838,-0.46856764744835983,0.34682823019324294,-0.3271431322739779,0.39977300536256899,2.0064405977328836,-1.3657440794832758,-0.43135032766535919,-0.85306646173418665,-0.40177383639793313
++0.33950035285998975,0.15849640325667502,-0.49609554806010503,-0.018576831520946763,0.55578199089409608,0.45861279610628009,-1.7072303011039842,-2.3724605196266855,-2.0233189490020931,0.81585214653615712,0.27141697586485736,-1.1361606560890372,0.7368126722132039,0.19183227604440364,1.7757065714365829,0.20688200627603387,-0.24285287918661724,0.52765908393086136,-1.6204159665668043,-0.060243936485902143,-2.2572286650767666,0.78278912666236666,-0.90142303069226193,1.4954209217125054,0.93976357935348365,-0.22172275729828167,-0.70922204793199772,-1.4588517757231203,0.021537614068418236,-0.88669898347694753,-2.0640000240789411,1.9952616298745864,-1.5077050988886955,-0.39468094532074965,-0.72646194873265957,-1.4545610530722277,-1.1866850682064487,-0.89481040695980052,1.41132422977793,0.88709316203930533
++1.9446557872127137,1.0665842496945273,0.65005567779410045,-0.4061415440209914,-0.7155374448227344,-1.7562630304421731,0.47420754092303852,1.0214143212893327,-0.50796426511996728,0.030788155040790376,-0.75829869065747546,0.59723119586205298,0.40917554388101041,1.6052800684237232,-1.7470395475790423,-0.79878717259777421,-0.84541686786645609,1.5680413364543089,0.15892391158792277,-0.19151809035817893,-0.39587382315551295,0.60057355953776992,-0.87973221872945562,2.3699748437915882,0.66591369836561365,-0.19874773053417369,-1.8583318729137981,-1.5090997125175358,-1.3452482948925157,0.70083307704916775,-0.45809058503037414,1.7336123653718951,1.9654042239882388,0.21099507404936454,-0.27327244774041792,-0.40430233915924163,-0.32020205526207729,0.60808445115314147,1.2104117780364954,1.5734657228590898
++-0.72346328129208104,0.62887973990080481,-0.46408885184801868,-0.15246372118811022,-0.007206792146729756,0.94286771468427555,-1.8407606910205703,0.84715232897748693,-1.7077658164670984,-0.30899050377857507,-0.78023199140971466,-0.071193519959638296,-1.5311799110216091,-0.026900300499714619,-0.16710294603222042,0.57478323441510548,-2.469595742386228,-0.10483765533047543,0.14337737854655302,-0.543319634855289,0.27893998851775287,1.6722428835092553,0.53174109740891651,1.4694334547856032,0.20933903448702484,-1.395291049333913,1.4097231083268595,-0.74731284274992738,-1.9150306381837909,0.75764554268639106,-0.61221992018063398,-0.21129150887499981,-0.73860000893131372,0.24320619828245876,-1.1676141165046188,1.6397962558806503,1.6060939633998388,-0.11718671395942494,1.6867186283002935,0.63718459212879819
++-1.7749688501621166,-0.26852563480488495,-1.0568119146605846,-1.0754345407313346,0.4715285986067887,-0.23537945398323953,-0.67587608750564043,0.55629116892865182,0.74303412901727528,1.2001925627088186,-0.77546194433115123,-0.64715071428297666,0.62699945931748724,0.61632761751666532,0.15781136067552212,0.76061851194594654,-0.22133479463379771,-0.43153198465567566,0.28458310938617926,-1.2826764946828144,-0.72950713282573321,0.62163125429167176,-0.6537164885860236,0.4197236604283423,1.2127281686705165,-0.23303371955240224,-0.016152962555484908,0.7807118784733148,1.4801242287080343,0.62062661785995543,0.40942490223543904,1.2111500168801423,-1.2292672801330111,-1.2200730110379161,0.83402586712852234,-0.31675616061967082,1.8054300958877605,-0.14683291664985076,2.2093218012781626,-1.1929776467073832
++-1.5523890654845367,0.73602148363667652,0.77679771833286337,0.8028043578366526,0.38089542699726875,-2.0647316652023426,-2.251793492665974,0.96490618323469524,0.23819956832263814,2.7344991698245305,-1.9612269427010594,3.3571946044924754,-1.3511373572046104,-0.47161675987843393,-0.74218738272899176,1.4391450965816661,0.97769144788458595,0.50395856424469443,0.16900269130804133,1.1357307043358089,2.0722227029160236,1.1363481082688072,-1.5107075715330001,0.62224762663600819,0.68499483665602079,0.73658381834623832,0.70927305011199326,0.58181048826829529,0.85092411756587116,1.2218086535674426,1.5277534189229136,-0.55520817692847912,0.16775036005955929,1.6304695361619137,-1.3042939166697964,0.46211366803703319,1.2656729167609413,0.81251524687711563,-1.731366602470769,1.340366772464761
++0.091993233674762392,0.15176060130459509,0.52457060379574949,-0.14892263299317549,0.47839879516934003,0.45396879508474625,0.12282872948094027,-0.87542398277575728,0.087217789003935578,-0.15722028819911196,0.18394283998644742,-0.99463731141648781,-0.9800915713144821,-0.19632983549275809,0.33561163759858337,-0.46750249568381735,-0.58410224654941512,-0.53469540553427453,-0.56282480345436059,-0.50143948855044729,-1.3690941101284146,-1.1026360789804315,0.034885091700651856,1.1775558267772703,-0.45970813430331275,0.19321300277925477,0.27066875747961322,1.2155249491022975,0.510305940463186,0.67247062858684969,1.0611154275658901,-0.5440511114614679,-0.79505523679844414,-0.76594233689004998,0.79563921721052833,-0.88837963006921183,-0.35143937421350013,2.3237543201980122,0.31984425199827266,-2.8734859553996812
++0.40890608742145396,-1.3946336731914157,1.3138628856679742,1.522256302515264,0.4835840739367252,0.23524284800596273,0.92283648686796782,0.054994511120552717,1.3829231790013237,3.2293718893037324,1.0361867591405343,1.16581887660079,-0.1427433820185586,2.2360010226180642,-0.24014398273759024,-0.3109789994378015,0.26236317239222801,-0.48305964765517451,-3.3186183870876635,-0.93960914585150002,-0.33955116027914845,-1.5008169112422445,1.0379329304812419,0.45264305661778376,0.029364436866308817,0.084196260370451165,0.99752459481956657,0.23763137580442084,-0.036930508663420611,-0.90463419516202104,-0.67491915005232239,0.98576094776549517,-0.51335626006657964,0.67376424397797252,-0.57876828605414388,-0.15003082349442504,-0.33894346707158701,0.55537286613443149,-0.66235934220474246,1.3382209648070913
++-1.0047023028987963,-1.0267384715730947,0.22497761741993527,0.75953355383570931,-0.56801544096810586,0.50976886850365977,0.71561628279753653,-0.49987562938563618,-0.98227600874781706,-0.029013534792032079,-0.52103840109187416,0.44960994227527662,0.18328911999669312,-1.2014278539446941,-0.26577410132950635,-1.4975180129863315,0.85798009083618099,-0.030608393939947822,0.20929732600090453,0.46518707461317144,-1.8011434227047873,1.2313247520452109,0.27957559314728642,0.80633408660375294,0.13659713491015144,-0.6578321795925467,0.25995677625823088,-0.33526797045442031,-1.0642787906316487,-1.8137967653818676,-0.86556693578742661,1.0974295120385442,0.38329445383469807,-0.12420661004634227,0.25295581224531238,0.0031771432711456002,0.22315541864943664,-0.74154151961132297,0.89029098206053603,1.2572719829030616
++0.47223229813549056,-0.93439604908158802,0.093341981491129572,-0.37010365857390409,-0.89487101982501105,-0.93029536673204527,-0.5748334975936864,-0.53002535074074308,-0.4230645232007324,0.034403754262478013,-2.1646682541980011,-0.150729464403318,-0.16788329211987679,-0.2957425226931184,-1.315723704502856,-0.39114784906792904,1.001669984625484,-1.4325783080033934,0.55654360982537632,-0.088595897699341578,0.1279298359876235,1.554387204422971,-2.0505218079957404,0.19839647713320546,0.38313921606430762,-1.1785652235559363,-0.65409872033739203,0.77965679591570747,-1.375396149423155,-1.1056089690589566,0.31146343516635178,1.7827825544163176,-1.8194769392938661,-0.3737593303796039,-0.69222369325006305,-0.88451348984507538,-0.80317702217798781,1.1085672648683025,1.4500746850831008,-0.5769985299778343
++0.83189618585113634,-1.3823531247358876,0.28225945095838484,-0.94574777372331353,0.25494020275859086,0.20587945977387545,1.3467055745303282,0.63434867166804743,0.41074371804762838,1.2996347963835773,0.59155041764035865,0.81915578837418002,1.4463241117288652,1.0892385452030473,1.0682848532579665,-0.34353045638179358,-0.45776370208209016,-0.49845329053715121,-0.72869408509800704,0.10258103181692643,-1.2399743884904932,0.25805306071355755,-1.3526957337073346,0.2374865978876507,-0.37921175895757125,0.68565104579783065,-0.26224334505765723,0.41742063597184842,-1.7305418131363552,0.69911918710032639,1.2752956662240593,1.0950920265221178,2.0214386457916795,0.50469200905038458,0.91440442088287588,-0.67601272648959343,-0.92057572529749665,-1.2952587467397232,-1.6604311240091785,-2.498872047979158
++-0.5578885134026984,-0.8114121519714278,-1.8701427291867185,-1.6455060275701168,0.61082225040601645,0.58875913572869409,-0.20655846532237052,1.3879899762828121,-0.8697736921503576,-1.3233899747735103,0.034590956703965767,-0.08317737241276249,1.197825550948987,-1.5810556701486691,0.29089201286997929,-0.33374296549556448,-0.13391008639964813,2.3219312191901227,-0.75901445940377144,-0.92851157798097594,0.6119920375428004,0.9152524608705358,0.36279571223344514,0.64071954388410812,-0.86689758177229914,-0.73868434405705607,0.27948825119491366,0.019320593501106244,0.98127176947916828,-0.35369325784112998,-0.70229380796349061,-0.035645880727222308,0.40093977992371593,-1.5234419948683564,-1.03478006297375,0.12738674091216431,-1.9399427752125962,-0.42171833551017862,0.085158204113503194,0.20066279549006483
++-2.0924702646059825,-0.18781009539724808,0.86889554112613843,0.86341582311840681,-1.1895345941592801,-2.3037480113979103,0.97506948845959884,-0.61968265262451794,-0.050456750503099404,0.089288821180344022,-1.1285544506152743,-1.0744431169580848,-1.9474577740961747,1.3570244279329984,-0.89735459667888784,-0.94693475695805829,-0.16193026157076146,0.533282752530291,0.0056313946385141353,-0.67846100059167225,-1.4510133751054928,-0.10744530746037638,-1.2690768509080581,1.0814678896864165,-0.52187353353346799,0.40620999071408026,2.0952758263161932,0.083673901093428663,-1.1576230713832356,1.8220180888915394,-0.33324902838191978,-0.13953107536096349,1.3831849008768013,-1.3611764427003519,-0.39630953878194092,0.44367444448903293,0.72487082112273682,-0.19299723032142166,1.4059443376770457,-0.1024606370102301
++-0.63437459460845003,-2.1685271530474681,0.750599603553886,-0.072040233061204537,-0.89466385462786024,0.38413269160459346,0.42606330641562445,-0.43011366298281312,0.38406829507828938,-0.16800689273489069,0.32604364489927268,0.40343223601172951,-0.28695219806254718,-0.52165988570640542,-1.3980573743673965,-0.30226824699454141,0.96199297976395992,-1.1686940616416943,-0.19844088443708552,-1.0557327813196964,0.80012242408642686,-0.25423756625029953,1.7050782564957139,-0.06234282484522969,-2.9153387410948679,0.12274626505106341,-0.61277467103062622,0.071009133976541142,0.12896912768346774,0.39912584015090202,1.3415233447083443,1.1936237918138366,0.83971195193940573,-0.3381251285508759,-0.20354335889913988,-0.036422005259275123,-1.5688344555644824,0.39779148079397997,-0.75832448810791264,1.0838320171420175
++-0.08973405898847886,-0.024656316523309657,-0.36296712462308933,-0.15945901428898115,0.75699539594279375,1.3059767315435185,1.5062025945416513,1.0667094362696736,-0.92723842104049714,-0.35409286756247199,-0.67002447165639978,0.69728346764563787,0.18791252199243363,0.25294080846363193,-2.4779805401680282,-1.4310061353525669,-1.5351174184652447,-0.17548073475750398,-0.82978949657029577,2.6324032882917958,0.53974182345554234,0.43996485653054573,-0.92526575450600235,0.55778960136222122,0.62268335868115199,-0.87927290963854932,0.38835470010058998,1.0355719500281981,-0.072574855282079617,2.1391850512915114,2.2421344709212163,-1.0335146705398432,-0.53961213089598203,-0.35989872795166838,0.021682923423375199,-0.021912453991405494,0.90490940798200503,0.061718494048423528,-0.76547333145636098,-0.193472387212233
++-0.83567066463661932,0.56954652195778344,0.59007444535358944,2.062650124801821,0.80433380446660474,0.054858402358186689,0.34522717965354455,-0.021524328988852159,0.85736483065701796,-0.081886505734776849,0.79490809641600058,0.10153399288329407,1.3209268847394757,0.42402483362280291,-0.44946711097043918,0.40033433165570398,1.4587509201726985,-2.0787228089662997,-0.80742774871995449,1.0208933661538566,0.6317321298909454,1.1896435431733201,1.0233745776163714,-0.87208314240660856,-0.11759757271735001,-0.82217628636319318,-0.31136688663470091,0.0190259637345041,-0.27704081489542615,-0.12132058053315203,-0.60218960690508894,-0.95154308098310725,1.6351271697626042,1.4407214110160123,-0.97279800032123587,-1.4112022005451248,-0.79827298056906415,0.24951506171373136,-1.4692199945751041,0.5065406847033691
++0.1306008404630595,-1.0560648932328194,-0.072616372098082832,1.0421789437605604,0.28538307993509715,1.8821929839033311,-0.48001029826640962,-1.0070065163743536,-0.55694773558371014,-0.10740851084463104,2.0187898573334397,-0.25034334471486985,0.47140394632501431,-0.62747232749340343,2.1107502988437834,0.26758991769926549,0.52822327550722381,0.84667351406126234,2.9031535702406868,1.0745026291854471,0.36186741335908235,-1.2245077693511548,-0.59009834210622902,-1.1110790622282107,-0.55629488831458385,-1.093549714370625,1.8638210306203218,-0.63692304546564882,1.5359751244280357,0.16476358411403363,1.5111106870300619,-0.78013634418277411,1.3218328516223912,0.75541481050577841,-0.61077471251994342,1.3388082688233469,-0.067229283352591318,-0.76892757503157727,-0.35344330240963767,0.048912168541591562
++-0.36738505372048591,1.0281148466379337,0.32153903734080724,0.28317324287869783,-0.45520427363810562,-0.67527674888407629,0.26764254743222793,0.069648378062456925,0.62798000144052157,-0.97977939122412061,0.73621646738589197,-0.89715951548115602,0.81207760687016561,0.291659311666077,-0.38690741628516301,0.97093297732628214,0.84526410539938002,-0.33726114252243,2.0775552625943208,0.44303564515266475,-0.38952762370908117,-0.59055517113359957,-2.0930163292843429,-1.7546768992930442,-2.6233910667771427,1.0546281412037266,0.67476216196662708,0.55191670536318305,-0.22557153729317328,0.79099506919938889,1.1442504196332905,-0.60800187489510193,-0.48278513273142604,1.9148288519768637,1.1616367400098018,-0.20309639656945333,0.85328643457769993,-0.81233062661007138,-1.0384685817136239,0.85367688272193021
++0.60645367389690374,-0.20445561509969609,-0.93567068229109884,1.1369244860609387,-0.24953744716128565,-1.3041072774605962,-1.384272797972864,-0.8536723093775499,-0.14377534167541808,0.30609613840860805,-1.8170377086863452,0.48480576772552963,1.4635043322566408,0.010261203346053738,1.7012977552326849,0.25425985910513416,0.16594724248905432,0.30772111243262174,-1.223623251303454,0.66437915838233985,0.11051159781088765,0.41528191723375851,-0.60752154571794326,-0.66582568519528651,0.038252764227029404,-0.47173576623848518,1.2016746807996137,-0.90805320518883015,-0.69327859238880152,0.9337282140201888,0.46229285505938239,-0.04370452081180249,0.26771164742105474,0.86518452451371508,0.79610409534534188,-0.92940043201132228,0.58928843729866054,0.37738146636555331,-0.52659642145838381,0.1042790783074198
++-1.5592738350766768,-1.0606505724150175,-1.4221806555963121,0.63089623332318745,-0.43605576004064395,0.98830071790189189,-0.25632484078152279,-0.17578882528291725,0.012560150553151168,-0.72876572891795088,-0.43627574122476237,-0.71621472013639176,-0.9126662262867693,1.0851653426557535,2.3152258094626941,0.48764000204744773,-0.13270849710887139,1.8230495155611139,0.17789529369158663,0.32063230126167586,-1.4801693242221245,2.1509122939002787,0.26211822877026919,-0.70777854612965596,1.1706351938609414,-0.015036346039591158,1.2169079253835444,0.085969659621932676,-1.3915111960068891,-0.71767788239018693,-1.4557262678012428,-0.66253345340067038,-0.18647421148017479,0.39196419981625447,2.4553438328829578,0.61740913623462945,1.0189859849580756,-0.24426644333053879,-0.06039916981593324,0.32104056226671274
++0.31352688630891357,0.0061569981385244769,-1.1305634580490949,2.2301723302586209,0.99367724640796262,0.23091304385963138,-0.46344862450590807,0.21009557576238264,-1.3735313195787107,-0.10876845695517912,-0.14984158375801751,-0.45466722282296185,-0.14684529364706919,-0.059502991552954444,0.31166383728406988,-1.6046215582957961,-1.2327856560831849,-0.58801545458572246,-0.85398932021594631,0.41652318130842564,1.394953157445858,0.70101172841005166,-0.78362371433909495,-0.33207241611905075,-0.067601023951441727,0.069769525387261902,0.45632169066483869,-0.50748243290392048,-1.0281493688143732,-1.0806377883760863,0.81332771047072439,-0.4619867249347514,0.62587021313525104,0.034593698692973789,1.3681031527482421,-0.022287819785476146,0.35184081399021822,-0.10383082833079811,1.8219698278341978,0.12035326439068891
++0.51777090744670207,0.20831589006689263,-0.75781064991777669,0.19269343263153813,0.8821401438610158,-1.5653156980938741,-1.5148399196928326,-0.03648601871902514,1.6414428455888028,0.74610893510501752,0.11672194616693618,-0.18000160422302855,-0.58678346180381236,1.35796456952143,-0.80002225149737682,0.66075691661700031,-0.51311397595845043,0.93671523149587133,1.0406026493226899,0.40204329674092915,-2.3948850503969092,-0.23420573917956655,-1.8874800484554148,-1.0232292910672278,1.0568726016514225,-0.92607493217189552,-0.2367907506491328,0.094009795897299714,0.56168264261692158,-3.0532883993568487,1.0819385629808724,1.1576429639832089,-1.5344185738676273,1.2091208202281714,-1.1236712976899277,-0.2228531327188282,-0.87433152964972405,-1.6021370100505894,-1.0029408755684219,-0.2206063525852352
+diff --git a/statsmodels/multivariate/tests/results/ridge_cca/ridge_wide/y.csv b/statsmodels/multivariate/tests/results/ridge_cca/ridge_wide/y.csv
+new file mode 100644
+index 000000000..df0f48855
+--- /dev/null
++++ b/statsmodels/multivariate/tests/results/ridge_cca/ridge_wide/y.csv
+@@ -0,0 +1,24 @@
++-0.82084239587258556,0.91488956723194004,0.18047686713628602,0.84527223404310647,-0.15496960311649707,-0.86340393389724768,0.2068366654100699,-2.0584166306023093,1.0262121373795696,0.24652812942038083,0.22992560271779861,1.7220296337700907,-1.5240944024933747,-0.33672773571785708,-0.15358114286870361,-1.1527509295732199,-0.6299121643008162,0.34656319785958867,0.0999262737910806,-0.51135024073831847,-1.9972813254073942,-0.22868944861604557,-1.3629610643195933,1.3263389070031462,0.91764758414428305,-0.2182600819408822,0.92584019058196887,0.60592956568344447,2.7035505902121311,-0.30191858490611501,0.47516600493848554
++-0.43348712163199687,0.95838335200407543,-2.4692981591511352,0.9558802489012721,-1.2270743804266295,0.0060871049812032396,-1.0474484281532919,-1.5890233131622968,-0.38042487430191529,0.14015952096715401,0.85498316810321029,2.1443323467858266,-0.38169640866183852,3.1365901801791343,3.1240782495915265,1.2229679596182332,0.082775289543346897,-1.2101025774343759,-1.0627864714332445,-2.2493932177413791,1.309471393749881,0.73482413720562589,-2.0629293209238888,2.5483944910874734,0.37412547907119154,-0.7942860221593816,-1.1347214792719862,-0.64522570027726367,1.7047174165452461,3.8594096377190095,-0.44494535597841395
++0.49801711533649889,-1.5978956717844917,2.1277115638963862,-1.0605017648693202,1.3248770022069469,1.4789227903978965,1.3540463592286929,1.8504121323413498,3.5100878827365269,-0.40299786638485041,0.67813549313384702,-0.48996770093668385,0.87399918162221735,0.099188274244826014,0.063563375299449776,0.3148976801873733,-0.95251103060305642,0.52696924746988183,1.5528808666452509,1.6527660615541671,-3.7573053331200548,0.55932566536051687,-0.25236121607019041,0.45510535715937311,0.54499082508724539,2.0885233441315605,1.9104306835843854,1.6445205739334747,-0.30668565730830433,-0.35356259812726876,0.52860211467248441
++-0.93369827884373102,0.5331885070903486,0.51253488419672333,-1.7764046393471502,0.31169952106740539,0.083715824224852298,-0.021950601524195673,-0.52292899701486117,0.64904654395172701,-0.21877165978506841,0.38366214093370182,-1.7646201419836118,0.89874953686937742,-0.32427846257013981,-1.6650064786092584,-0.59787602801677808,-0.79745516000908989,-0.35978456846750623,-1.033428259085907,1.1671919393716084,0.24282310691027065,0.8056775092976135,0.99562067966210299,-1.076194990550837,-0.45545793044273569,0.41298791143333569,0.8531839841757427,0.50614465782982576,1.6475657487325159,-0.23262204349438198,-0.2614768240269339
++3.3164065302878849,-3.8775207773312239,3.5375972450107485,-1.2939251131138885,3.5073799720695096,1.0864720753909236,2.8611291972389621,2.0384534311593492,2.1278099689195424,-0.23943821334359555,0.029106590342118505,-3.3909238534068025,1.1387167094596227,-2.8476246526981162,-3.2057314461835142,-2.3454345383436941,-1.5635987529783648,1.7837700088426438,0.15978280572030501,1.5211396063459488,-5.279186295831825,-1.2950731637548765,0.75619307209728803,-3.0267300148765752,-0.72780084559858971,0.49089078260313257,1.7505320974471237,1.5365060337003376,-1.3163049327865097,-6.6175592740816489,-0.61268005828055716
++-0.85903943825963303,-0.44731802795612285,0.73557868713607721,-0.61160838256718697,-1.4445369637440741,-0.96984928321620834,1.6485470304512091,-1.4548128675802821,0.47699998140602062,-1.5016319628588539,-0.83018044574854344,1.2677468500276081,0.23965541032518312,2.4388798566241792,0.81892258700623444,-0.48475512360917894,0.34490112542448015,0.82655128405055911,-1.478879074151261,-1.7340836176244401,-0.80261892941725144,-0.80208488886281581,-2.8730286611555549,2.0824381020228362,-0.8015007617259553,-0.37198047582077021,-0.55045439202249302,-2.3324194429796181,1.0471315965206747,1.5090328948591936,-0.10143634718572669
++-4.1128515314680261,3.0311634649045569,-1.6286734953616371,2.0045566495800715,-2.124095893706643,-2.344939036939941,-0.67973207790421797,-3.776739540122835,-0.83038327976727577,3.5091138456871662,-0.58089579084725651,2.8281506401944321,-3.4762160045332964,3.8342724766205687,2.6127372331795256,1.9223566860147865,0.31536302420799622,-0.00047622706917516133,-0.64088651280272779,-3.5549552119690704,3.4798900874320235,0.99332252309333868,-1.1753757319649134,0.79677086716839951,2.6137000855068875,-0.81738416196748287,-0.5403082328154446,0.57832815276553928,3.2577932363129447,3.6143823078030008,-0.79038372530806167
++-3.872765601878577,0.51954053063258665,-1.4623960226585371,0.2855513167595613,-3.6998494290769379,-1.0834530042277524,0.81332429578955634,-1.5260455424332287,-2.3280271986928289,1.210504099807741,2.6581944971458773,4.277448890088249,-2.4163247248562816,4.5309245866481156,2.0179932245182211,-0.3467123894585693,0.29800214741890241,0.29758306673447965,0.0063746736570583495,-1.2994211577633346,0.54085213192167736,0.021909977261571845,-3.1755191491592125,2.130609702182173,-1.4934236392164073,-3.3838013630290575,0.62501442175463118,-1.3981141233009018,3.8321059997107354,2.2719646734453174,-0.66978308812218323
++0.99286621609840098,-0.39559599517580046,0.57984315459007929,0.38493715336386619,-0.45093857356536032,-1.1362783232554554,-0.38001472430119609,0.91286376788475232,-0.57751998834114859,-0.071785306574031066,-0.15543583174239395,0.68204993689180993,2.5217971766067553,0.080885712243066635,0.5492509608417897,1.2735728377178785,-0.04011609523110022,-1.0000189417806333,2.2913508190211624,2.3989018258903902,0.0044835591742418135,-1.027641585230977,-0.31433678270066018,-0.27192405477725423,0.22933937514405189,1.071293110622803,0.51590621760444177,0.039315572318015662,1.1229043913439209,-1.0162111692892049,0.37209341220674536
++1.5832602771281818,0.58432343965826816,-0.72554756302612611,-0.52040073557399646,-0.50140133221038341,0.58654496758030161,-1.3955232534109843,0.74157723983703683,-2.6603999699872971,1.2773011224979078,0.17303541698668079,-1.3711742094221036,2.9127140110812513,-0.56014876156000548,-0.85068802316199899,0.26984424502382703,2.786249665732484,0.92365716999690461,-1.5844444100306336,-1.7359708471519548,3.2398905303283581,-0.29800139894160416,1.047277358596757,-0.82621882690342441,-0.49699421280945827,2.0600668534878128,-3.6048593886170961,0.60506032490170425,0.5173346979615836,-0.69416561252505926,-1.1064512982546175
++0.58494909377347248,2.6636640299776184,-0.72499244149317754,0.8346268628380672,-3.5127560420140398,-0.22223509195802596,-0.28046410385845155,-2.5353048528652238,-2.1363591892081897,0.71814995372016299,-0.25472486721519949,0.0057169755078858575,1.5705680905912001,0.67722570574131535,1.9209078972439879,-0.032693483969918558,0.78668596682151415,-1.5885107101654565,-1.0975126409739475,-2.9242614592451979,3.6709297018326548,-0.34887643337332963,-0.26042296604526521,0.77151578361282458,0.67336360828996833,-0.62943926369326175,-2.9681688917288591,-2.1725766962651241,-0.41021845244057942,3.7051468920708754,1.2774668047387869
++0.47664724879949294,-1.3773500512104699,-1.3513540018244907,-0.45186250226630487,0.53950606319078886,0.52782721181227188,-1.7917574803481331,2.3900070247683605,0.34940549668458953,-1.1690410316493156,-0.28751121541820152,-1.0521780922996307,1.3795832141418187,0.11133007553758456,1.8570969815810843,1.4530290301098532,-0.92269880729817888,0.24531444047339651,0.14739073553580925,-1.0411755107325114,1.4607790544078387,-0.57570100159255344,0.26759714612136865,-2.20046368199985,0.57975231882460831,0.48542590438914368,-3.040008442580675,1.2248279655603582,-1.2755700667654788,-0.39928915285549915,-0.31373615202104693
++0.18791142636538405,-2.4312129711973003,1.2273076563938832,-0.43468396370857321,0.20956490591311233,2.1963660646312366,-1.6868067487394316,0.2529402749183709,-2.1411323960751432,1.7930940799017172,-0.65309943984338659,-2.7259553515070776,1.6500820129180307,-3.0328043672173877,-2.5674912724523216,-3.7080728461511225,0.036612954031640277,-2.0568235337975893,-1.2211539398096856,-2.7863692052271221,2.4257743488496373,-1.1128105756788065,1.5171663046941823,-0.38673221786527434,-0.845817631220245,1.9939565451347359,-1.1092876856310967,0.18673507780148446,0.58528229045124824,1.3860412745206792,1.1915188125389673
++-0.53551462406402073,1.1269553017439433,-1.4330357340016922,1.8482641182105048,-2.3832331852349506,1.5318928978000093,-0.71790257965864945,0.66996714194783147,-0.75256211678393514,0.67363043334901962,-2.4332227223671774,0.57359108912076273,-1.1426312294600813,0.54932151283083475,0.19636588555671652,-1.857382804245908,-0.16089868318224504,-0.91866994774937083,1.0827083717048978,-2.4545453507461281,3.2031413790410839,-0.67593394660188411,0.55140355594867296,0.99786018735563364,0.30104762431020238,0.004497614616429918,-1.1462767686086823,-1.2287020963273061,-0.071069124145899609,1.8295661453211569,-0.3879956109644962
++-1.9499198515544243,2.7168067455447118,-1.7350577563637113,2.5001103713606549,-4.1063555012467212,-2.1992658398228127,-1.4759635635174475,-4.740050838835888,-0.33198882564638454,1.8974233062183987,-0.45752896311895852,3.0826516539100002,-2.4795287300510163,3.1807557447233217,5.1381181907616345,2.5247930788188464,0.88958327487149658,-0.23187932606035444,-0.49276013505500349,-2.2855467953301503,4.227009546446852,-0.33307343586172733,-1.7873974658877514,0.47322497400877883,1.6243365183389924,-1.6798122655886019,-0.80387736993485337,-1.9873613484907935,1.8499736843700578,5.1962502743263075,-1.6543594621200883
++0.20588660353985314,3.3678977612042753,-1.352329969033053,3.5963144467990498,-3.1516467470790142,1.3622699274945425,-1.4705361234922105,-1.9705484483438405,-3.4485115504375066,0.47838447832132958,-0.27174354269362078,-1.7915595055337543,3.1093424578754369,0.3966686544403818,1.5079310704709117,1.8335728030938294,1.0006955298766287,-0.078383375817047574,0.0038568446563569392,-3.5081855271930715,6.1589774923089582,-1.1939421985378962,2.5534023755590471,-1.4620419586390778,0.18063389262102636,0.34725344626215199,-2.6219880516700065,0.34479804762275701,2.6366389194181066,2.9581125750304889,-2.060577239455704
++0.39216659996350411,0.50165031928929893,0.18637018710441516,0.28417661235148145,-1.8976484985234339,-2.024751947996958,-0.22123522880597801,-1.7099882322261593,0.18222383733702863,0.25306070244081147,-0.44278783665394272,-0.096589139251479245,-0.21770144067878661,0.41088795075661921,-0.41343446995200528,0.53927903277520117,1.1772967639955922,-0.01283959325027012,1.8159522158177455,-0.55074245028748126,0.34260049913308965,-0.5385328901385481,-0.86771912441597432,-2.7536879834332013,0.0052005541594078858,-1.1276357449658363,0.40677191297644627,-0.67633281627678976,1.0153236735802422,-0.62555677948167443,0.74817084586224958
++-1.7316627957422426,-1.4747742066698548,-0.24689817473926223,-0.21348446304340907,-2.6261126683738061,-1.5521990307998048,-0.062253514547423228,-0.4606714711127875,0.04467296543784588,0.26918321772163201,0.1817179538266698,-0.61068745342461894,-1.0488998144348525,1.453243403009878,1.4905238124139881,0.88224553885587798,-0.00050329485856635825,0.20612266191684486,-1.27868752985617,-0.46687176091285504,-0.75153587337640293,-0.36508659118728048,-1.295373993315754,1.8309292729137918,-0.21297901086095727,-2.4506153832011925,0.59064959135092465,-0.051475998449515448,0.33162513410950889,-0.34531379291640529,1.5689768159139743
++1.2200292708477172,0.59267886843943662,-1.0452882275987072,-0.74806535434249288,-0.01585844486973409,2.1540062326806453,-0.15149574831562573,1.3180204855734774,-1.0407761887049141,-1.9939671859574295,0.85694233195698488,1.0276788924852194,1.9247988739092459,-1.3590461344962506,-0.95606598930039632,-0.0048949699748898207,-0.20320099790625018,1.3098582942465495,-0.77733262572334172,-1.3555863322007484,2.4696869096263141,0.24780001724424566,0.30184528416362122,-0.67676091135104299,2.1041179504144858,1.7027837899201272,-1.0035476466355742,1.5817153349919728,1.2793539934748497,1.856714684965918,1.5291700303368976
++-1.7470387695700529,0.56124713098678647,1.4068999385351197,0.58429385233575082,-0.37930635817199909,-1.2511836658505726,1.5022607277571431,-1.7544729571371311,2.3254508296620418,-0.052459710701336038,0.89590111045272236,1.9159623270498911,-1.5667653642706048,-0.12013410963134863,0.39819737337960603,-0.63307083434451483,0.36996500629829898,1.2906020856792133,1.8170311966519848,0.65218306732002707,-2.9774839684559602,0.94544500617400862,0.62445237872869819,1.9528216491482628,-1.1305370932370717,-0.16485919562478957,0.90570993487666651,-1.1047711700053391,0.28522477548396308,0.74907856773293913,0.05787032616105111
++-0.047530393664367954,-0.60626966151570616,-0.33927890060791721,-1.5057747679365563,2.1371983573952864,0.77474860422249681,-0.95798288895334538,2.4292230611190107,1.0544018135840014,-1.3685836144507555,-0.10884342820230339,-2.1048456915046501,-0.050221328651857244,0.090409566045516199,-1.4910445654551299,-1.9987326910521266,1.6161582239223522,-1.4388642588849485,2.0765790453227861,0.75594517376619319,-0.76578417306957725,-1.3753689291670232,2.7170523301382117,-1.0113751113329292,0.90262501392553052,0.3848318685727446,-0.34082871282147781,-0.19022308005173716,-1.2552620106358889,-0.55207778432528243,0.36026635541150503
++-1.1232446477740514,2.4669654191844721,-2.6870619514872218,1.0443137836279757,-2.3994692862504512,0.26348784171158202,-1.4656486641257209,-3.4961056795235486,-1.8005784436973902,0.89805977817844362,-0.51725842179732284,2.4716045205660757,-1.286779504910895,2.9985067609401646,1.9207183185992576,1.558733256636736,-0.80181159224383514,-1.153719434948494,-0.2804359603127583,-5.1640372284450162,4.3658076459055621,-2.4322860344011112,-1.4227895497338059,0.2754721346211767,0.85769129168956204,-2.2073964294862325,-1.9168717132586086,-0.72065381119359551,2.3739503366693069,4.0036858569286924,0.2364642575521195
++-0.19789937178389622,2.199456661708127,1.3620598021853547,-1.1128284178787191,0.49235144656383539,0.094048040415935619,0.72998914335198628,-0.52579251075888511,-0.12748780131383078,1.3560635715698319,-0.35927394607852764,-1.6161144056663301,-0.34885329678375609,-0.2998365788165282,0.049160309280115666,-0.43529639708523987,0.056684575523792427,0.49034374627816796,-0.37359955096215447,1.4377710968114252,0.31848746200397832,-0.28541764958485455,2.3464916340040292,0.31935407098148338,-0.67145081056656042,-0.14404083386026761,-0.71947779337406215,-1.8406010700036228,-0.6647804034201823,-2.7380252878370555,0.30263811927188272
++1.4877421167172518,0.14213578133200067,0.73629778902594545,0.034841554179623702,1.6869239102976064,0.81030955771148694,1.6789948834870008,2.7016878325434277,0.11126822357318322,1.3980846530983029,-0.70283275277589785,0.20288160151822998,1.538932572093116,-1.7708645416371607,0.056777676041141256,0.70619283230282992,0.90909356256034468,0.46901117343269388,0.62694179302711395,-0.43005569995753279,-2.2055580850156247,-1.1824276430047247,1.2406204256047153,-0.14205107274203899,-1.3237616502311429,1.2268544454327719,-1.0772147801169194,-0.68987389331318327,-0.85522698065167357,0.2828017083331027,-0.68703539785774259
+diff --git a/statsmodels/multivariate/tests/test_cancorr_cv.py b/statsmodels/multivariate/tests/test_cancorr_cv.py
+new file mode 100644
+index 000000000..f24053239
+--- /dev/null
++++ b/statsmodels/multivariate/tests/test_cancorr_cv.py
+@@ -0,0 +1,89 @@
++import numpy as np
++from numpy.testing import assert_allclose, assert_array_equal
++import pytest
++
++from statsmodels.multivariate.cancorr import CanCorr
++
++
++def select(*args, **kwargs):
++    from statsmodels.multivariate.cancorr import select_cancorr_penalty
++    return select_cancorr_penalty(*args, **kwargs)
++
++
++def correlation(model, x, y):
++    u, v = model.transform(x, y)
++    return np.corrcoef(u[:, 0], v[:, 0])[0, 1]
++
++
++def test_cv_matches_train_only_preprocessing_and_manual_fold_scores():
++    rng = np.random.default_rng(93)
++    x = rng.normal(size=(30, 6))
++    y = x[:, :2] @ rng.normal(size=(2, 4)) + rng.normal(size=(30, 4))
++    x[::3] *= 100
++    y[1::3] += 100
++    grid = [(0.1, 1), (1, 0.1), (1, 1)]
++    result = select(y, x, grid, cv=3, standardize=True, rng=72)
++    expected = np.empty((len(grid), 3))
++    for i, penalty in enumerate(grid):
++        for j, (train, validation) in enumerate(result.folds):
++            model = CanCorr(y[train], x[train], penalty=penalty, standardize=True)
++            expected[i, j] = correlation(model, x[validation], y[validation])
++    assert_allclose(result.cv_scores, expected, atol=1e-12)
++    assert_allclose(result.mean_scores, expected.mean(1), atol=1e-12)
++    assert result.penalty == grid[np.argmax(expected.mean(1))]
++    assert_allclose(result.model.x_mean, x.mean(0))
++    assert_allclose(result.model.y_mean, y.mean(0))
++    # Standardizing before splitting would change the fitted directions here.
++    train, validation = result.folds[0]
++    x_global, y_global = x / x.std(0, ddof=1), y / y.std(0, ddof=1)
++    leaked = CanCorr(y_global[train], x_global[train], penalty=grid[0])
++    leaked_score = correlation(leaked, x_global[validation], y_global[validation])
++    assert abs(leaked_score - expected[0, 0]) > 1e-6
++
++
++def test_cv_keeps_negative_validation_correlations():
++    x = np.random.default_rng(8).normal(size=(30, 3))
++    y = x[:, :1].copy()
++    first_validation = np.random.default_rng(31).permutation(len(x))[:10]
++    y[first_validation] *= -1
++    result = select(y, x, [(1, 1)], cv=3, rng=31)
++    assert result.cv_scores[0, 0] < -0.9
++
++
++def test_cv_ties_prefer_larger_total_penalty():
++    x = np.arange(30.)[:, None]
++    result = select(x, x, [(0.1, 0.1), (10, 1)], cv=3, rng=2)
++    assert result.penalty == (10, 1)
++
++
++def test_cv_reproducibility_without_modifying_global_rng():
++    x = np.random.default_rng(9).normal(size=(30, 3))
++    y = np.random.default_rng(10).normal(size=(30, 2))
++    state = np.random.get_state()[1].copy()
++    a = select(y, x, [(0.1, 1), (1, 1)], cv=3, rng=14)
++    b = select(y, x, [(0.1, 1), (1, 1)], cv=3, rng=14)
++    assert_array_equal(a.cv_scores, b.cv_scores)
++    assert_array_equal(np.random.get_state()[1], state)
++    validation_rows = np.concatenate([test for _, test in a.folds])
++    assert_array_equal(np.sort(validation_rows), np.arange(len(x)))
++    for train, test in a.folds:
++        assert len(np.intersect1d(train, test)) == 0
++
++
++def test_inapplicable_zero_penalty_is_recorded_and_not_selected():
++    x = np.random.default_rng(1).normal(size=(18, 25))
++    y = np.random.default_rng(2).normal(size=(18, 20))
++    result = select(y, x, [(0, 0), (1, 1)], cv=3, rng=1)
++    assert result.penalty == (1, 1)
++    assert np.isnan(result.mean_scores[0])
++    assert len(result.failures) == 3
++    with pytest.raises(ValueError, match=r"candidate|penalt"):
++        select(y, x, [(0, 0)], cv=3, rng=1)
++
++
++@pytest.mark.parametrize("grid,cv", [([], 3), ([(1, -1)], 3), ([(1, 1)], 1),
++                                    ([(1, 1)], 11), ([(1, 1)], 1.5)])
++def test_invalid_cv_configuration(grid, cv):
++    x = np.random.default_rng(1).normal(size=(20, 3))
++    with pytest.raises(ValueError):
++        select(x, x, grid, cv=cv, rng=1)
+diff --git a/statsmodels/multivariate/tests/test_cancorr_ridge.py b/statsmodels/multivariate/tests/test_cancorr_ridge.py
+new file mode 100644
+index 000000000..28e69cf60
+--- /dev/null
++++ b/statsmodels/multivariate/tests/test_cancorr_ridge.py
+@@ -0,0 +1,99 @@
++"""Ridge extension of CanCorr, including independent R reference values."""
++
++from pathlib import Path
++
++import numpy as np
++from numpy.testing import assert_allclose, assert_array_equal
++import pandas as pd
++import pytest
++
++from statsmodels.multivariate.cancorr import CanCorr
++
++
++def paired_data(n=45, p=7, q=5):
++    rng = np.random.default_rng(148)
++    x = rng.normal(size=(n, p))
++    y = x[:, :2] @ rng.normal(size=(2, q)) + rng.normal(size=(n, q))
++    return x, y
++
++
++def test_explicit_zero_penalty_preserves_classical_outputs():
++    x, y = paired_data()
++    old = CanCorr(y, x)
++    zero = CanCorr(y, x, penalty=(0, 0))
++    assert_array_equal(zero.cancorr, old.cancorr)
++    assert_array_equal(zero.x_cancoef, old.x_cancoef)
++    assert_array_equal(zero.y_cancoef, old.y_cancoef)
++    pd.testing.assert_frame_equal(zero.corr_test().stats, old.corr_test().stats)
++    u, _ = zero.transform(x, y)
++    assert_allclose(u.T @ u, np.eye(len(zero.cancorr)), atol=1e-12)
++
++
++@pytest.mark.parametrize("case,penalty", [
++    ("classical", (0, 0)), ("ridge_lowdim", (0.3, 1.2)), ("ridge_wide", (0.3, 1.2)),
++])
++def test_ridge_matches_independent_r_reference(case, penalty):
++    fixture = Path(__file__).parent / "results/ridge_cca" / case
++    x = np.loadtxt(fixture / "x.csv", delimiter=",")
++    y = np.loadtxt(fixture / "y.csv", delimiter=",")
++    ref = np.loadtxt(fixture / "r_results.csv", delimiter=",", skiprows=1)
++    model = CanCorr(y, x, penalty=penalty)
++    assert_allclose(model.penalized_roots[:3], ref[:, 0], atol=1e-8, rtol=1e-6)
++    assert_allclose(model.cancorr[:3], ref[:, 1], atol=1e-8, rtol=1e-6)
++    for view, coefs in [("x", model.x_cancoef), ("y", model.y_cancoef)]:
++        expected = np.loadtxt(fixture / f"r_{view}_weights.csv", delimiter=",")
++        q1 = np.linalg.qr(coefs[:, :3], mode="reduced")[0]
++        q2 = np.linalg.qr(expected, mode="reduced")[0]
++        assert_allclose(np.linalg.svd(q1.T @ q2, compute_uv=False), np.ones(3), atol=1e-8)
++
++
++def test_penalized_gram_constraints_and_separate_score_correlations():
++    x, y = paired_data(n=18, p=32, q=25)
++    model = CanCorr(y, x, penalty=(0.3, 1.2))
++    xc, yc = x - x.mean(0), y - y.mean(0)
++    gx = xc.T @ xc + (len(x) - 1) * model.lambda_x * np.eye(x.shape[1])
++    gy = yc.T @ yc + (len(y) - 1) * model.lambda_y * np.eye(y.shape[1])
++    k = len(model.cancorr)
++    assert_allclose(model.x_cancoef.T @ gx @ model.x_cancoef, np.eye(k), atol=1e-10)
++    assert_allclose(model.y_cancoef.T @ gy @ model.y_cancoef, np.eye(k), atol=1e-10)
++    assert np.max(abs(model.cancorr - model.penalized_roots)) > 0.01
++
++
++def test_transform_uses_training_preprocessing_and_accepts_one_row():
++    x, y = paired_data()
++    model = CanCorr(y, x, penalty=(0.1, 1), standardize=True)
++    u, v = model.transform(x[:1] + 100, y[:1] - 100)
++    assert_allclose(u, (x[:1] + 100 - model.x_mean) @ model.x_cancoef)
++    assert_allclose(v, (y[:1] - 100 - model.y_mean) @ model.y_cancoef)
++    assert_allclose(model.x_mean, x.mean(0))
++    assert_allclose(model.y_mean, y.mean(0))
++
++
++def test_negative_heldout_correlation_is_preserved():
++    x = np.arange(8.)[:, None]
++    model = CanCorr(x, x, penalty=1)
++    u, v = model.transform(x, -x)
++    assert_allclose(np.corrcoef(u[:, 0], v[:, 0])[0, 1], -1, atol=1e-12)
++
++
++def test_legacy_f_test_is_not_available_for_ridge():
++    x, y = paired_data()
++    model = CanCorr(y, x, penalty=(1, 0))
++    with pytest.raises(NotImplementedError, match=r"regulariz|penal"):
++        model.corr_test()
++
++
++def test_only_the_unpenalized_view_requires_full_column_rank():
++    x, y = paired_data()
++    x = np.column_stack([x, x[:, 0]])
++    model = CanCorr(y, x, penalty=(1, 0))
++    assert np.isfinite(model.cancorr).all()
++    with pytest.raises(ValueError, match=r"rank|collinear"):
++        CanCorr(y, x, penalty=(0, 1))
++
++
++@pytest.mark.parametrize("penalty", [-1, (0, -1), (1, 2, 3), np.nan, (np.inf, 1)])
++def test_invalid_penalties_are_rejected(penalty):
++    x, y = paired_data()
++    with pytest.raises(ValueError):
++        CanCorr(y, x, penalty=penalty)

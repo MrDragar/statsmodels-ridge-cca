@@ -1,0 +1,2 @@
+# Unified diff context contains single-space lines; preserve them verbatim.
+statsmodels.patch -whitespace

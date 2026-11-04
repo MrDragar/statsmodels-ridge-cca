@@ -1,0 +1,122 @@
+{
+  "audit_date": "2026-11-04",
+  "revisions": {
+    "statsmodels/statsmodels": "295b96e65000793aeaf9a95fd7e97e73bace6557",
+    "cran/CCA": "969734bb9dda03fff4ef38443aec869165ca6d59",
+    "andersonwinkler/PermCCA": "5046146c4882a68896cac95f92132e62c5628669"
+  },
+  "artifacts": [
+    {
+      "url": "https://raw.githubusercontent.com/statsmodels/statsmodels/295b96e65000793aeaf9a95fd7e97e73bace6557/statsmodels/multivariate/cancorr.py",
+      "path": "research/cache/statsmodels/statsmodels/multivariate/cancorr.py",
+      "bytes": 7304,
+      "sha256": "b8c33d3c43c78b6459e811d4850c8a31c1a28dba3f06a090db996a582fb0be99",
+      "rehydrate": true
+    },
+    {
+      "url": "https://raw.githubusercontent.com/statsmodels/statsmodels/295b96e65000793aeaf9a95fd7e97e73bace6557/statsmodels/multivariate/tests/test_cancorr.py",
+      "path": "research/cache/statsmodels/statsmodels/multivariate/tests/test_cancorr.py",
+      "bytes": 4822,
+      "sha256": "f897f105e7115b11a8fa7754fe9531c65882ab375619f8ca6bb8957895740a87",
+      "rehydrate": true
+    },
+    {
+      "url": "https://raw.githubusercontent.com/statsmodels/statsmodels/295b96e65000793aeaf9a95fd7e97e73bace6557/CONTRIBUTING.md",
+      "path": "research/cache/statsmodels/CONTRIBUTING.md",
+      "bytes": 4764,
+      "sha256": "f21dc328dcabf93b3cdde27824e44a7f0844c79d683dfc4d93d2d038cd8a4a55",
+      "rehydrate": true
+    },
+    {
+      "url": "https://raw.githubusercontent.com/statsmodels/statsmodels/295b96e65000793aeaf9a95fd7e97e73bace6557/AGENTS.md",
+      "path": "research/cache/statsmodels/AGENTS.md",
+      "bytes": 17718,
+      "sha256": "9917d02717da66d796f8c8657420696c2625be241102c6d600a88ef00b54ed45",
+      "rehydrate": true
+    },
+    {
+      "url": "https://raw.githubusercontent.com/cran/CCA/969734bb9dda03fff4ef38443aec869165ca6d59/DESCRIPTION",
+      "path": "research/cache/CCA/DESCRIPTION",
+      "bytes": 679,
+      "sha256": "f7f391320a14dbbd2f95a4ce75339a5a5bc6fb37d6f2dcfd2dac1d27316a9444",
+      "rehydrate": true
+    },
+    {
+      "url": "https://raw.githubusercontent.com/cran/CCA/969734bb9dda03fff4ef38443aec869165ca6d59/NAMESPACE",
+      "path": "research/cache/CCA/NAMESPACE",
+      "bytes": 392,
+      "sha256": "f3880f28fe4395688b320f752ca492046758fbbcb37ce4d8a7fa7f520f96b139",
+      "rehydrate": true
+    },
+    {
+      "url": "https://raw.githubusercontent.com/cran/CCA/969734bb9dda03fff4ef38443aec869165ca6d59/R/rcc.R",
+      "path": "research/cache/CCA/R/rcc.R",
+      "bytes": 638,
+      "sha256": "d4817e25e6ddb88a31b7bb8405d62ca2e6774628e66f82280a176fbd3597c41e",
+      "rehydrate": true
+    },
+    {
+      "url": "https://raw.githubusercontent.com/cran/CCA/969734bb9dda03fff4ef38443aec869165ca6d59/R/comput.R",
+      "path": "research/cache/CCA/R/comput.R",
+      "bytes": 698,
+      "sha256": "599fdced3c1eecebfb58b1c15dacffd533346eca4e2ff2a3207b668e96147a4e",
+      "rehydrate": true
+    },
+    {
+      "url": "https://raw.githubusercontent.com/cran/CCA/969734bb9dda03fff4ef38443aec869165ca6d59/man/nutrimouse.Rd",
+      "path": "research/cache/CCA/man/nutrimouse.Rd",
+      "bytes": 1836,
+      "sha256": "14831a427343c093a9e807add2bb01b6b811286b02ebe183b8a6ac57072452dc",
+      "rehydrate": true
+    },
+    {
+      "url": "https://raw.githubusercontent.com/andersonwinkler/PermCCA/5046146c4882a68896cac95f92132e62c5628669/permcca.m",
+      "path": "research/cache/PermCCA/permcca.m",
+      "bytes": 7023,
+      "sha256": "61902bc80dcc0e30a28301db251a721f2a4475ff0c8c8ae917aa55501a77ad60",
+      "rehydrate": true
+    },
+    {
+      "url": "https://raw.githubusercontent.com/andersonwinkler/PermCCA/5046146c4882a68896cac95f92132e62c5628669/README.md",
+      "path": "research/cache/PermCCA/README.md",
+      "bytes": 947,
+      "sha256": "cf68e65aebed329a68bde2a97d195434298a637c7bc44fd9c00058cd5f40cd4c",
+      "rehydrate": true
+    },
+    {
+      "url": "https://archive.ics.uci.edu/static/public/72/multiple+features.zip",
+      "path": "data/raw/multiple_features.zip",
+      "bytes": 5498711,
+      "sha256": "898a50a7637f1ed5a8cee2493aaa0e7f4d52795c412f59b0969ec7c3046ee7bd",
+      "rehydrate": true
+    },
+    {
+      "url": "https://archive.ics.uci.edu/dataset/72/multiple+features",
+      "path": "research/cache/uci_multiple_features.html",
+      "bytes": 204385,
+      "sha256": "db84bdc0d0b2e4292684441c4a677c8f911b81f5ba802fd95a70e9c0ce77587c",
+      "rehydrate": false
+    },
+    {
+      "url": "https://pypi.org/pypi/statsmodels/json",
+      "path": "research/cache/statsmodels_pypi.json",
+      "bytes": 748391,
+      "sha256": "0551920642f254d22d41e5671db7df6b3c7ee4ff2385490d552b12769ab44aa2",
+      "rehydrate": false
+    },
+    {
+      "url": "https://pypi.org/pypi/cca-zoo/json",
+      "path": "research/cache/cca-zoo_pypi.json",
+      "bytes": 269765,
+      "sha256": "94838ae41a966a048cf2c60afeef6420a937a7b42f5f18b76d5ea39ef3204299",
+      "rehydrate": false
+    },
+    {
+      "url": "https://pypi.org/pypi/scikit-learn/json",
+      "path": "research/cache/scikit-learn_pypi.json",
+      "bytes": 1422044,
+      "sha256": "7f2c77f9da0b1765ccd00fe236628488f1645a0e8d14e2f38bdcc85d2ea477dd",
+      "rehydrate": false
+    }
+  ]
+}
